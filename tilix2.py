@@ -12,7 +12,7 @@
 #            paned-griff; ctrl+alt+right/down split, ctrl+shift+w close, ctrl+shift+c/v
 #            copy/paste (bracketed paste), ctrl+shift+ +/- zoom, maus-rad scrollt scrollback
 #            (bzw. maus-events, wenn die app mouse-tracking anfordert)
-import os, sys, pty, struct, fcntl, termios, subprocess
+import os, sys, pty, struct, fcntl, termios, shutil, subprocess
 
 try:
     import gi
@@ -90,8 +90,8 @@ def hexrgb(s, default):
     except ValueError:
         return default
 
-TERM_NAME = 'xterm-ghostty' if subprocess.run(['infocmp', 'xterm-ghostty'],
-                                              capture_output=True).returncode == 0 else 'xterm-256color'
+TERM_NAME = 'xterm-ghostty' if shutil.which('infocmp') and subprocess.run(
+    ['infocmp', 'xterm-ghostty'], capture_output=True).returncode == 0 else 'xterm-256color'
 DEFAULT_FONT = os.environ.get('TILIX2_FONT', 'Monospace 11')   # zoom-reset-ziel, einmal gelesen
 
 
@@ -163,7 +163,7 @@ class Tile(Gtk.Box):
 
     def _tick(self):
         "pwd + scrollbar aktualisieren (1x/s reicht)."
-        if self.view.dead or self.view.proc.poll() is not None:
+        if self.view.dead:
             return False
         try:
             cwd = os.readlink(f'/proc/{self.view.proc.pid}/cwd')
@@ -248,10 +248,11 @@ class TermView(Gtk.DrawingArea):
         shell = os.environ.get('TILIX2_SHELL') or os.environ.get('SHELL') or '/bin/sh'
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', self.rows, self.cols, 0, 0))
-        env = dict(os.environ); env['TERM'] = TERM_NAME
-        self.proc = subprocess.Popen([shell], stdin=slave, stdout=slave, stderr=slave,
-                                     preexec_fn=lambda: (os.setsid(), fcntl.ioctl(0, termios.TIOCSCTTY, 0)),
-                                     env=env, close_fds=True)
+        env = dict(os.environ, TERM=TERM_NAME, COLORTERM='truecolor')
+        # neue session + pty als controlling tty -> close(master) schickt der shell SIGHUP
+        self.proc = subprocess.Popen([shell], stdin=slave, stdout=slave, stderr=slave, env=env,
+                                     start_new_session=True,
+                                     preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0))
         os.close(slave)
         # WICHTIG: io-watch erst starten, wenn das widget第一次 allokiert ist.
         # ein io-callback (feed+queue_draw) während der initialen layout-phase lässt ein
@@ -260,19 +261,15 @@ class TermView(Gtk.DrawingArea):
         self._want_watch = True
 
     def kill(self):
+        "pty zu -> kernel schickt SIGHUP (bash schreibt dann noch die history). reapen async, nix blockiert."
+        if self.term._t is None: return
         self.dead = True
         if self._io_src:
             GLib.source_remove(self._io_src)
             self._io_src = None
         try: os.close(self.master)
         except OSError: pass
-        if self.proc.poll() is None:
-            self.proc.terminate()
-            try: self.proc.wait(timeout=2)   # sonst Zombie bis app-exit
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                try: self.proc.wait(timeout=1)   # auch gekillte prozesse reapen
-                except subprocess.TimeoutExpired: pass
+        GLib.child_watch_add(GLib.PRIORITY_DEFAULT, self.proc.pid, lambda pid, status: None)
         self.term.close()
 
     def write(self, data):
@@ -304,6 +301,7 @@ class TermView(Gtk.DrawingArea):
         if not data or cond & (GLib.IO_HUP | GLib.IO_ERR):
             # prozess beendet (z. b. ctrl+d/exit): kachel gibt ihren platz frei (tilix-verhalten)
             self.dead = True
+            self._io_src = None                   # return False entfernt die source schon
             GLib.idle_add(self.win.close, self.tile)
             return False
         return True
@@ -348,35 +346,35 @@ class TermView(Gtk.DrawingArea):
         self.queue_draw()
 
     # --- input ---
-    def send_key(self, keyval, state):
-        "keyval/state -> ghostty key-encoder -> pty. returns True wenn behandelt."
+    def send_key(self, keyval, state, keycode=0, text=None):
+        """keyval/state -> ghostty key-encoder -> pty. returns True wenn behandelt.
+        text: was das IM committed hat (dead keys/compose); sonst aus dem keyval abgeleitet."""
+        if self.dead: return False
         name = Gdk.keyval_name(keyval) or ''
         if name in MODIFIER_KEYS: return False
-        gk = KEYMAP.get(name)
         mods = ghostty_mods(state)
-        u = Gdk.keyval_to_unicode(keyval)
-        utf8 = chr(u) if u else None
-        ctrlish = mods & (2 | 4 | 8)          # ctrl/alt/super
+        if text is None:
+            u = Gdk.keyval_to_unicode(keyval)
+            text = chr(u) if u >= 0x20 and u != 0x7f else None   # steuerzeichen macht der encoder selbst
+        gk = KEYMAP.get(name)
         if gk is None:
-            if not utf8 or ctrlish: return False   # ctrl/alt/super ohne mapping: nicht text
+            if not text: return False
             gk = 'UNIDENTIFIED'
-        # ctrl/alt/super + gemappte taste: KEIN utf8 setzen, sonst schluckt der encoder
-        # das modifier und sendet plain text (ctrl+d -> 'd'). stattdessen nur den
-        # unshifted codepoint + consumed_mods, dann kommt 0x04 (legacy) bzw. CSI 100;5u (kitty).
-        send_utf8 = None if (ctrlish and gk != 'UNIDENTIFIED') else utf8
-        consumed = ctrlish if (gk != 'UNIDENTIFIED' and ctrlish) else 0
+        # unshifted codepoint (kitty): taste ohne modifier über das layout auflösen (de: shift+1 -> '1')
+        ok, base = False, 0
+        if keycode:
+            ok, base, *_ = Gdk.Display.get_default().translate_key(keycode, 0, 0)
+        u = Gdk.keyval_to_unicode(base if ok else Gdk.keyval_to_lower(keyval))
         ev = ffi.new('GhosttyKeyEvent*')
         lib.ghostty_key_event_new(ffi.NULL, ev)
         lib.ghostty_key_event_set_action(ev[0], lib.GHOSTTY_KEY_ACTION_PRESS)
         lib.ghostty_key_event_set_key(ev[0], getattr(lib, 'GHOSTTY_KEY_' + gk))
         lib.ghostty_key_event_set_mods(ev[0], mods)
-        lib.ghostty_key_event_set_consumed_mods(ev[0], consumed)
-        # kitty-protocol will das UNshifted codepoint: shift+a -> 'a', nicht 'A'
-        if utf8:
-            unshifted = utf8.lower() if utf8.isupper() else utf8
-            lib.ghostty_key_event_set_unshifted_codepoint(ev[0], ord(unshifted))
-        if send_utf8:
-            b = send_utf8.encode()
+        # shift hat den text erzeugt ('A', '!') -> verbraucht, sonst schickt kitty CSI 97;2u statt 'A'
+        lib.ghostty_key_event_set_consumed_mods(ev[0], mods & 1 if text else 0)
+        if u >= 0x20: lib.ghostty_key_event_set_unshifted_codepoint(ev[0], u)
+        if text:
+            b = text.encode()
             lib.ghostty_key_event_set_utf8(ev[0], b, len(b))
         lib.ghostty_key_encoder_setopt_from_terminal(self.enc[0], self.term._t[0])
         out = ffi.new('char[]', 64); n = ffi.new('size_t*')
@@ -390,7 +388,7 @@ class TermView(Gtk.DrawingArea):
                 min(self.rows - 1, max(0, int(y // self.cell_h))))
 
     def _mouse_tracking(self):
-        return self.term.get('mouse_tracking', 'int') != 0
+        return self.term.get('mouse_tracking', 'bool')
 
     def _mencode(self, action, button, cx, cy):
         ev = ffi.new('GhosttyMouseEvent*')
@@ -413,6 +411,7 @@ class TermView(Gtk.DrawingArea):
     _BTN = {1: 'GHOSTTY_MOUSE_BUTTON_LEFT', 2: 'GHOSTTY_MOUSE_BUTTON_RIGHT', 3: 'GHOSTTY_MOUSE_BUTTON_MIDDLE'}
 
     def _press(self, g, n, x, y):
+        if self.dead: return
         self.grab_focus()
         self.win.active = self.tile      # aktives terminal fürs splitten/tippen tracken
         self.win.set_title(self.title or 'tilix2')
@@ -433,6 +432,7 @@ class TermView(Gtk.DrawingArea):
             self.queue_draw()
 
     def _release(self, g, n, x, y):
+        if self.dead: return
         btn = g.get_current_button()
         cx, cy = self._cell_at(x, y)
         if self._mouse_tracking():
@@ -443,6 +443,7 @@ class TermView(Gtk.DrawingArea):
             self.queue_draw()
 
     def _motion(self, m, x, y):
+        if self.dead: return
         self.mouse_pos = (x, y)
         if self._mouse_tracking() and m.get_current_event_state() & Gdk.ModifierType.BUTTON1_MASK:
             cx, cy = self._cell_at(x, y)
@@ -453,6 +454,7 @@ class TermView(Gtk.DrawingArea):
             self.queue_draw()
 
     def _scroll(self, c, dx, dy):
+        if self.dead: return True
         cx, cy = self._cell_at(*self.mouse_pos)
         if self._mouse_tracking():
             btn = lib.GHOSTTY_MOUSE_BUTTON_FOUR if dy < 0 else lib.GHOSTTY_MOUSE_BUTTON_FIVE
@@ -491,7 +493,7 @@ class TermView(Gtk.DrawingArea):
         if not text: return
         d = Gdk.Display.get_default()
         if d:
-            cp = Gdk.ContentProvider.new_for_bytes('text/plain', GLib.Bytes.new(text.encode()))
+            cp = Gdk.ContentProvider.new_for_value(text)   # gtk serialisiert in alle text-formate
             d.get_clipboard().set_content(cp)          # ctrl+shift+v
             d.get_primary_clipboard().set_content(cp)  # maus-markierung -> middle-click paste
 
@@ -499,10 +501,16 @@ class TermView(Gtk.DrawingArea):
         "clipboard (ctrl+shift+v) oder primary selection (middle-click)."
         def done(src, res):
             try: t = src.read_text_finish(res)
-            except Exception: return
-            if not t: return
-            if self.term.mode(2004): t = '\x1b[200~' + t + '\x1b[201~'
-            self.write(t.encode())
+            except GLib.Error: return
+            if not t or self.dead: return
+            # ghostty_paste_encode: ESC & co. -> space (kein ausbruch aus bracketed paste),
+            # klammert bei mode 2004, sonst \n -> \r. data wird in-place gesäubert.
+            data = t.encode()
+            src_buf = ffi.new('char[]', data)
+            out = ffi.new('char[]', len(data) + 12)    # + '\e[200~' + '\e[201~'
+            n = ffi.new('size_t*')
+            if lib.ghostty_paste_encode(src_buf, len(data), self.term.mode(2004), out, len(out), n) == 0:
+                self.write(ffi.buffer(out, n[0])[:])
         d = Gdk.Display.get_default()
         if d:
             sel = d.get_primary_clipboard() if primary else d.get_clipboard()
@@ -677,6 +685,14 @@ class Win(Gtk.ApplicationWindow):
         self.terms = set()
         self.active = None            # zuletzt angeklickte kachel
         kc = Gtk.EventControllerKey(); kc.connect('key-pressed', self._on_key); self.add_controller(kc)
+        # input method: dead keys (^ ´ `), compose, ibus. bekommt jede taste, committed text
+        # geht als utf8 mit in den key-encoder (siehe _on_key).
+        self.im = Gtk.IMMulticontext()
+        self.im.set_client_widget(self)
+        self.im.connect('commit', self._im_commit)
+        self._im_text = None          # != None nur während filter_keypress läuft
+        kc.connect('key-released', lambda c, *a: self.im.filter_keypress(c.get_current_event()))
+        self.connect('notify::is-active', lambda w, p: self.im.focus_in() if w.is_active() else self.im.focus_out())
         self.set_title('tilix2')
         self.set_default_size(1000, 700)
         for name in ('split-h', 'split-v', 'close', 'copy', 'paste', 'zoom-in', 'zoom-out',
@@ -691,7 +707,7 @@ class Win(Gtk.ApplicationWindow):
         self.count_lbl = Gtk.Label(label='1 kachel')
         hb.pack_start(self.count_lbl)
         def hbtn(action, icon, tip):
-            b = Gtk.Button(icon_name=icon)
+            b = Gtk.Button(icon_name=icon, focus_on_click=False)   # sonst frisst der button enter/space
             b.set_tooltip_text(tip)
             b.set_action_name('win.' + action)
             return b
@@ -701,7 +717,7 @@ class Win(Gtk.ApplicationWindow):
         for label, act in (('nach links', 'move-left'), ('nach rechts', 'move-right'),
                            ('nach oben', 'move-up'), ('nach unten', 'move-down')):
             mv.append(label, 'win.' + act)
-        mb = Gtk.MenuButton(icon_name='object-select-symbolic', menu_model=mv)
+        mb = Gtk.MenuButton(icon_name='object-select-symbolic', menu_model=mv, focus_on_click=False)
         mb.set_tooltip_text('tile verschieben')
         hb.pack_start(mb)
         hb.pack_end(hbtn('close', 'window-close-symbolic', 'kachel schließen (ctrl+shift+w)'))
@@ -750,8 +766,22 @@ class Win(Gtk.ApplicationWindow):
             if name == 'Right': self._action(None, None, 'split-h'); return True
             if name == 'Down':  self._action(None, None, 'split-v'); return True
         tv = self._focused()
-        if tv: return tv.view.send_key(keyval, state)
-        return False
+        if not tv: return False
+        ev = ctrl.get_current_event() if ctrl else None   # selftest ruft ohne controller
+        if ev is not None:
+            self._im_text = ''
+            filtered = self.im.filter_keypress(ev)
+            text, self._im_text = self._im_text, None
+            if filtered and not text: return True        # dead key / compose läuft noch
+            if filtered: return tv.view.send_key(keyval, state, keycode, text)
+        return tv.view.send_key(keyval, state, keycode)
+
+    def _im_commit(self, im, text):
+        if self._im_text is not None:
+            self._im_text += text             # synchron aus filter_keypress -> _on_key schickt's
+        else:
+            tv = self._focused()              # asynchron (ibus): direkt als text
+            if tv: tv.view.write(text.encode())
 
     def _action(self, a, param, name):
         tv = self._focused()
@@ -781,6 +811,8 @@ class Win(Gtk.ApplicationWindow):
         def do_split():
             paned = Gtk.Paned(orientation=orient)   # default-handle ist schmal; wide_handle wäre zu dick
             paned.set_hexpand(True); paned.set_vexpand(True)
+            # halbe größe der alten kachel (die ist schon allokiert, das neue paned noch nicht)
+            paned.set_position((tv.get_height() if vertical else tv.get_width()) // 2)
             parent = tv.get_parent()
             if isinstance(parent, Gtk.Paned):
                 if parent.get_start_child() is tv: parent.set_start_child(None)
@@ -790,8 +822,6 @@ class Win(Gtk.ApplicationWindow):
             new = Tile(self)
             paned.set_start_child(tv)
             paned.set_end_child(new)
-            paned.set_position((paned.get_height() if vertical else paned.get_width()) // 2
-                               or (self.get_height() if vertical else self.get_width()) // 2)
             if isinstance(parent, Gtk.Paned):
                 if parent.get_start_child() is None: parent.set_start_child(paned)
                 else: parent.set_end_child(paned)
@@ -800,14 +830,6 @@ class Win(Gtk.ApplicationWindow):
             self.active = new
             self._refresh_count()
             new.view.grab_focus()
-            # nach dem ersten allocate nochmal exakt auf die hälfte justieren
-            def place(_=None):
-                size = paned.get_height() if vertical else paned.get_width()
-                if size > 0:
-                    paned.set_position(size // 2)
-                    return False
-                return True
-            GLib.timeout_add(30, place)
             return False
         GLib.idle_add(do_split)
 
@@ -881,7 +903,9 @@ class Win(Gtk.ApplicationWindow):
 
 class App(Gtk.Application):
     def __init__(self, selftest):
-        super().__init__(application_id='osuv.tilix2')
+        # NON_UNIQUE: jeder start ist ein eigener prozess (kein d-bus-handoff an eine laufende
+        # instanz -> crash reißt nur ein fenster mit, tests laufen neben der echten app)
+        super().__init__(application_id='osuv.tilix2', flags=Gio.ApplicationFlags.NON_UNIQUE)
         self.selftest = selftest
 
     def do_activate(self):
@@ -1056,8 +1080,8 @@ class App(Gtk.Application):
                             win._on_key(None, Gdk.KEY_A, 38, Gdk.ModifierType.SHIFT_MASK)
                         finally:
                             os.write = ow
-                        # kitty flags=1: shift+a -> CSI 97;2u (unshifted codepoint 97='a', mod 2=shift)
-                        assert any(b'97;2u' in s for s in sent2), f'shift+a unshifted falsch: {sent2!r}'
+                        # kitty flags=1 (disambiguate): text-tasten mit nur shift bleiben text -> 'A'
+                        assert b''.join(sent2) == b'A', f'shift+a im kitty-mode falsch: {sent2!r}'
                         v2.term.feed(b'\x1b[<u')
                         # ctrl+alt+right shortcut geht window-level ans aktive terminal
                         # (split läuft in idle_add -> kurz pumpen bis terms wächst)
