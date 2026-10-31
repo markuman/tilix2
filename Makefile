@@ -1,19 +1,20 @@
 # tilix2 — makefile. plain `make` shows what's available.
-.PHONY: help install run test selftest clean uninstall
+.PHONY: help install run test clean uninstall
 
 PREFIX   ?= $(HOME)/.local
 BINDIR   := $(PREFIX)/bin
 APPDIR   := $(PREFIX)/share/tilix2
 VENV     := $(APPDIR)/venv
 PY       := $(VENV)/bin/python
+# tilix2 nutzt pyghostty-interna (_t, _format_sel) -> version pinnen
+PYGHOSTTY := 0.1.4
 
 help:
 	@echo "tilix2 — tiling terminal (gtk4 + libghostty-vt via pyghostty)"
 	@echo ""
 	@echo "  make install    install to $(BINDIR)/tilix2 (+ venv with pyghostty in $(APPDIR)/venv)"
 	@echo "  make run        run from the repo (uses repo venv if present, else system python)"
-	@echo "  make test       run test-suite (tests/checks.py all; gui checks need DISPLAY, use xvfb-run)"
-	@echo "  make selftest   run only the app selftest (needs DISPLAY)"
+	@echo "  make test       run test-suite (gui checks need DISPLAY: xvfb-run -a make test)"
 	@echo "  make uninstall  remove $(BINDIR)/tilix2 and $(APPDIR)"
 	@echo "  make clean      remove __pycache__"
 
@@ -22,7 +23,7 @@ install:
 	cp tilix2.py $(APPDIR)/tilix2.py
 	@if [ ! -x $(VENV)/bin/python ]; then \
 		echo "creating venv at $(VENV) (needs python3-gi/gtk4 on system, hence --system-site-packages)"; \
-		python3 -m venv --system-site-packages $(VENV) && $(VENV)/bin/pip install -q pyghostty; \
+		python3 -m venv --system-site-packages $(VENV) && $(VENV)/bin/pip install -q pyghostty==$(PYGHOSTTY); \
 	fi
 	@printf '#!/bin/sh\nexec %s %s/tilix2.py "$$@"\n' '$(PY)' '$(APPDIR)' > $(BINDIR)/tilix2
 	@chmod +x $(BINDIR)/tilix2
@@ -34,10 +35,6 @@ run:
 test:
 	@if [ -x venv/bin/python ]; then PY=venv/bin/python; else PY=python3; fi; \
 	$$PY tests/checks.py all
-
-selftest:
-	@if [ -x venv/bin/python ]; then PY=venv/bin/python; else PY=python3; fi; \
-	$$PY tests/checks.py selftest
 
 uninstall:
 	rm -f $(BINDIR)/tilix2

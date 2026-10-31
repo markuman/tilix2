@@ -1,13 +1,14 @@
 # tilix2
 
 A tilix-style tiling terminal in a single Python file, powered by
-[libghostty-vt](https://github.com/mitchellh/ghostty) (the same VT core ghostty uses)
+[libghostty-vt](https://github.com/ghostty-org/ghostty) (the same VT core ghostty uses)
 via [pyghostty](https://pypi.org/project/pyghostty/) — not VTE.
 
-One file, no framework acrobatics: `tilix2.py` (~1000 lines) is the whole app.
-GTK4 for the UI, cairo/pango for rendering, each tile gets its own pty + ghostty
-terminal instance. Kitty keyboard protocol is handled by ghostty's own key encoder,
-so `ctrl+enter` in a TUI arrives as `CSI 13;5u` instead of a colliding `\r`.
+One file, no framework acrobatics: `tilix2.py` is the whole app. GTK4 for the UI,
+cairo/pango for rendering from ghostty's render state (only dirty rows get rebuilt),
+each tile gets its own pty + ghostty terminal. Keys go through ghostty's key encoder
+(kitty keyboard protocol, so `ctrl+enter` in a TUI arrives as `CSI 13;5u`) and through
+a GTK input method first (dead keys, compose, ibus).
 
 ## Install
 
@@ -19,42 +20,39 @@ or manually:
 
 ```sh
 python3 -m venv --system-site-packages venv   # --system-site-packages: gi/gtk4 come from the system
-./venv/bin/pip install pyghostty
+./venv/bin/pip install pyghostty==0.1.4
 ./venv/bin/python tilix2.py
 ```
 
-System requirements: GTK4 + gobject-introspection (`python3-gi`), a font with pango.
+System requirements: GTK4 + gobject-introspection (`python3-gi`), pycairo, a monospace font.
 
 ## Usage
 
 - right-click a tile: split right/down, move tile, copy/paste, zoom, close
+  (shift+right-click when the app grabbed the mouse)
 - shortcuts: `ctrl+alt+right/down` split, `ctrl+shift+w` close tile,
-  `ctrl+shift+c/v` copy/paste (bracketed paste aware), `ctrl+shift +/-` zoom (active tile only),
-  `ctrl+shift+0` zoom reset
-- drag a tile's header onto a neighbor to swap them
-- each tile has a header with the cwd and a slim scrollbar on the right (drag = scroll viewport)
-- closing the last tile (`ctrl+d`/`exit` in the shell) closes the window
+  `ctrl+shift+c/v` copy/paste, `ctrl+shift +/-/0` zoom/reset (active tile only)
+- select with the mouse (shift+drag inside mouse-grabbing apps) -> primary selection,
+  middle-click pastes it. selections survive scrolling.
+- pastes are sanitized by ghostty (no escape out of bracketed paste)
+- drag a tile's header onto its neighbor to swap them
+- a new split starts in the cwd of the active tile
+- each tile has a header with its cwd and a slim scrollbar
+- closing a tile sends SIGHUP to its shell (bash saves its history); a shell exiting
+  closes its tile, the last tile closes the window
+- every start is its own process (no D-Bus single instance)
 
 env vars: `TILIX2_SHELL`, `TILIX2_FONT` (e.g. `Monospace 12`), `TILIX2_FG`/`TILIX2_BG` (`#rrggbb`)
 
 ## Tests
 
 ```sh
-python tests/checks.py encoder     # headless: vt/encoder (no display needed)
-python tests/checks.py gui         # needs DISPLAY (xvfb-run -a python tests/checks.py gui)
-python tests/checks.py selftest    # app-level selftest (needs DISPLAY)
-```
-
-## Layout
-
-```
-tilix2.py        the app (Win: headerbar + paned-tree, Tile: header+scrollbar+view, TermView: pty+vt+render)
-tests/checks.py  encoder | layout | render | scrollbar | perf | selftest
-Makefile         install / run / test / clean
+python tests/checks.py encoder            # headless: key encoder / vt (no display needed)
+xvfb-run -a python tests/checks.py        # everything
+xvfb-run -a python tests/checks.py render # one gui check: layout|input|clipboard|render|scrollbar|perf
 ```
 
 ## Known limitations
 
-- software rendering (cairo on CPU), no GPU path — ~5 ms/frame warm at 1920 cells, fine for typing
-- no tabs, no sessions/profiles, no kitty graphics protocol rendering (images pass through as text)
-- selection is viewport-anchored and cleared on scroll
+- software rendering (cairo on CPU) — fine for typing; cached pango layouts per row
+- no tabs, no sessions/profiles, no kitty graphics, no cursor blinking, no hyperlinks
