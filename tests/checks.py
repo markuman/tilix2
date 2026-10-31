@@ -75,6 +75,13 @@ def capture(view):
 def key(win, keyval, state=0, keycode=0):
     return win._on_key(None, keyval, keycode, state)
 
+def kc(keyval):
+    "keycode der taste, die keyval erzeugt (layout-unabhängig: '+' ist auf de/us eine andere taste)"
+    from gi.repository import Gdk
+    ok, keys = Gdk.Display.get_default().map_keyval(keyval)
+    assert ok and keys, f'keyval {keyval:#x} nicht im layout'
+    return keys[0].keycode
+
 def surface(view):
     import cairo
     w, h = view.cols * view.cell_w, view.rows * view.cell_h
@@ -106,6 +113,8 @@ def gui_layout(win):
     assert t2.get_parent().get_orientation() == Gtk.Orientation.VERTICAL
     key(win, Gdk.KEY_Right, Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK)
     assert pump_until(lambda: len(win.tiles()) == 4), 'ctrl+alt+right splittet nicht'
+    sizes = lambda: [(t.view.get_width(), t.view.get_height()) for t in win.tiles()]
+    assert pump_until(lambda: all(w > 50 and h > 50 for w, h in sizes())), f'kachel mit 0px: {sizes()}'
     # schließen blockiert nicht und die shell bekommt SIGHUP
     victim = win.active
     t0 = time.time(); win.close_tile(victim); dt = time.time() - t0
@@ -137,17 +146,17 @@ def gui_input(win):
     MT = Gdk.ModifierType
     v = win.active.view
     sent = capture(v)
-    key(win, Gdk.KEY_a, 0, 38); key(win, Gdk.KEY_Return, 0, 36)
+    key(win, Gdk.KEY_a, 0, kc(Gdk.KEY_a)); key(win, Gdk.KEY_Return, 0, kc(Gdk.KEY_Return))
     assert sent == [b'a', b'\r'], sent
     v.term.feed(b'\x1b[>1u')
-    sent.clear(); key(win, Gdk.KEY_d, MT.CONTROL_MASK, 40)
+    sent.clear(); key(win, Gdk.KEY_d, MT.CONTROL_MASK, kc(Gdk.KEY_d))
     assert sent == [b'\x1b[100;5u'], f'kitty ctrl+d: {sent}'
-    sent.clear(); key(win, Gdk.KEY_A, MT.SHIFT_MASK, 38)
+    sent.clear(); key(win, Gdk.KEY_A, MT.SHIFT_MASK, kc(Gdk.KEY_a))
     assert sent == [b'A'], f'kitty shift+a: {sent}'
-    sent.clear(); key(win, Gdk.KEY_Return, MT.CONTROL_MASK, 36)
+    sent.clear(); key(win, Gdk.KEY_Return, MT.CONTROL_MASK, kc(Gdk.KEY_Return))
     assert sent == [b'\x1b[13;5u'], f'kitty ctrl+enter: {sent}'
     v.term.feed(b'\x1b[<u\x1b[>8u')     # flag 8: alle tasten als CSI u -> unshifted codepoint sichtbar
-    sent.clear(); key(win, Gdk.KEY_exclam, MT.SHIFT_MASK, 10)
+    sent.clear(); key(win, Gdk.KEY_exclam, MT.SHIFT_MASK, kc(Gdk.KEY_1))
     assert sent and sent[0].startswith(b'\x1b[49;'), f'shift+1 unshifted != "1": {sent}'
     v.term.feed(b'\x1b[<u')
     # IM-commit außerhalb von filter_keypress (ibus asynchron) geht direkt als text raus
@@ -157,7 +166,7 @@ def gui_input(win):
     v.term.feed(b''.join(b'line %d\r\n' % i for i in range(200)))
     v.scroll(lib.GHOSTTY_SCROLL_VIEWPORT_DELTA, -10)
     assert not v.term.get('viewport_active')
-    key(win, Gdk.KEY_a, 0, 38)
+    key(win, Gdk.KEY_a, 0, kc(Gdk.KEY_a))
     assert v.term.get('viewport_active'), 'tippen scrollt nicht nach unten'
     # maus: SGR-encoding, middle ist button 1 (nicht 2)
     v.term.feed(b'\x1b[?1000h\x1b[?1006h')
@@ -170,17 +179,18 @@ def gui_input(win):
     # pty-roundtrip durch `cat`
     v.write(b'MARKER_123\r')
     assert pump_until(lambda: v.term.contents().count('MARKER_123') >= 2), v.term.contents()[-200:]
-    # zoom nur aktive kachel; tasten nach physischer taste (us-layout unter xvfb: 21 '=', 20 '-', 19 '0')
+    # zoom nur aktive kachel; matcht nach physischer taste -> keycode aus dem aktuellen layout
     win.split(win.active, vertical=False)
     assert pump_until(lambda: len(win.tiles()) == 2)
     a, other = win.active, [t for t in win.tiles() if t is not win.active][0]
     f0, fo = a.view.font, other.view.font
-    key(win, Gdk.KEY_plus, MT.CONTROL_MASK | MT.SHIFT_MASK, 21)
+    CS = MT.CONTROL_MASK | MT.SHIFT_MASK
+    key(win, Gdk.KEY_plus, CS, kc(Gdk.KEY_plus))
     assert a.view.font != f0 and other.view.font == fo, 'zoom-in falsch'
-    key(win, Gdk.KEY_underscore, MT.CONTROL_MASK | MT.SHIFT_MASK, 20)
+    key(win, Gdk.KEY_underscore, CS, kc(Gdk.KEY_minus))
     assert a.view.font == f0, 'zoom-out falsch'
-    key(win, Gdk.KEY_plus, MT.CONTROL_MASK | MT.SHIFT_MASK, 21)
-    key(win, Gdk.KEY_parenright, MT.CONTROL_MASK | MT.SHIFT_MASK, 19)
+    key(win, Gdk.KEY_plus, CS, kc(Gdk.KEY_plus))
+    key(win, Gdk.KEY_parenright, CS, kc(Gdk.KEY_0))   # shift+0 ist auf us ')', auf de '='
     assert a.view.font == tilix2.DEFAULT_FONT, 'zoom-reset falsch'
 
 def gui_clipboard(win):
@@ -321,7 +331,7 @@ GUI = {'layout': gui_layout, 'input': gui_input, 'clipboard': gui_clipboard, 're
 
 def run_gui(fn):
     "fn(win) in einer frischen app; assertion -> exit 1."
-    os.environ['TILIX2_SHELL'] = 'cat'
+    os.environ.setdefault('TILIX2_SHELL', 'cat')
     import tilix2
     from gi.repository import GLib
     app = tilix2.App()

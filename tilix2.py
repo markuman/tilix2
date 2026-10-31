@@ -186,6 +186,7 @@ class TermView(Gtk.DrawingArea):
         self.set_font(self.win.font)
         self._start_shell(cwd)
         self.set_draw_func(self._draw)
+        self.connect('resize', lambda area, w, h: self._fit(w, h))
         # tasten kommen window-level rein (Win._on_key), hier nur maus
         click = Gtk.GestureClick(button=0)          # alle buttons
         click.connect('pressed', self._press); click.connect('released', self._release)
@@ -219,7 +220,7 @@ class TermView(Gtk.DrawingArea):
                                      start_new_session=True,
                                      preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0))
         os.close(slave)
-        self._io_src = None     # io-watch startet beim ersten size_allocate, s. dort
+        self._io_src = GLib.io_add_watch(self.master, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self._io)
 
     def cwd(self):
         return os.readlink(f'/proc/{self.proc.pid}/cwd')
@@ -310,14 +311,6 @@ class TermView(Gtk.DrawingArea):
         except OSError: pass
         self.tile.sync_sbar()
 
-    def do_size_allocate(self, width, height, baseline):
-        Gtk.DrawingArea.do_size_allocate(self, width, height, baseline)
-        if self.dead: return
-        # pty erst lesen, wenn die kachel eine größe hat: ein draw/resize während des
-        # paned-umbaus in split() hat das neue paned empirisch dauerhaft auf 0px gelassen.
-        if self._io_src is None:
-            self._io_src = GLib.io_add_watch(self.master, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self._io)
-        self._fit(width, height)
 
     # --- tastatur ---
     def send_key(self, keyval, state, keycode=0, text=None):
@@ -736,15 +729,15 @@ class Win(Gtk.ApplicationWindow):
         elif name.startswith('move-'): self.move(t, name[5:])
 
     # --- tiling-baum aus Gtk.Paned ---
-    # GTK4 (empirisch): ein dynamisch eingehängtes Paned bekommt nur dann eine breite, wenn
-    # der umbau komplett in einer idle-phase passiert (children + position setzen, dann erst
-    # einhängen). verteilt auf mehrere main-loop-iterationen bleibt es dauerhaft 0px.
     def split(self, tile, vertical):
         "kachel halbieren, neue kachel (im selben cwd) auf die andere hälfte, die neue wird aktiv."
-        def do_split():
+        def do_split(widget, clock):
+            # die split-position kommt aus der größe der kachel. eine gerade erst entstandene
+            # kachel (split direkt nach split) hat noch kein layout -> einen frame warten.
+            if not tile.get_width():
+                return True
             paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL if vertical else Gtk.Orientation.HORIZONTAL,
                               hexpand=True, vexpand=True)
-            # halbe größe der alten kachel (die ist schon allokiert, das neue paned noch nicht)
             paned.set_position((tile.get_height() if vertical else tile.get_width()) // 2)
             try: cwd = tile.view.cwd()
             except OSError: cwd = None
@@ -756,7 +749,7 @@ class Win(Gtk.ApplicationWindow):
             self._replace(parent, None, paned)
             self.activate_tile(new)
             return False
-        GLib.idle_add(do_split)
+        tile.add_tick_callback(do_split)
 
     def _replace(self, parent, old, new):
         "child old von parent (Paned oder self.box) durch new ersetzen; None = leer / einhängen."
@@ -797,14 +790,11 @@ class Win(Gtk.ApplicationWindow):
             self.activate_tile(src)
 
     def _swap_children(self, p):
-        "GTK4: children erst auf None, dann vertauscht neu setzen (direkt -> assertion). in einer idle-phase."
-        def do():
-            a, b, pos = p.get_start_child(), p.get_end_child(), p.get_position()
-            p.set_start_child(None); p.set_end_child(None)
-            p.set_start_child(b); p.set_end_child(a)
-            p.set_position(pos)
-            return False
-        GLib.idle_add(do)
+        "GTK4: children erst auf None, dann vertauscht neu setzen (ein widget kann nicht zwei slots haben)."
+        a, b, pos = p.get_start_child(), p.get_end_child(), p.get_position()
+        p.set_start_child(None); p.set_end_child(None)
+        p.set_start_child(b); p.set_end_child(a)
+        p.set_position(pos)
 
 
 SLIM_CSS = b"""
