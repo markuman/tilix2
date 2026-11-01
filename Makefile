@@ -6,7 +6,7 @@ BINDIR   := $(PREFIX)/bin
 APPDIR   := $(PREFIX)/share/tilix2
 VENV     := $(APPDIR)/venv
 PY       := $(VENV)/bin/python
-# tilix2 nutzt pyghostty-interna (_t, _format_sel) -> version pinnen
+# tilix2 uses pyghostty internals (_t, _format_sel) -> pin the version
 PYGHOSTTY := 0.1.4
 
 help:
