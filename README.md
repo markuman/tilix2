@@ -40,7 +40,9 @@ System requirements: GTK4 + gobject-introspection (`python3-gi`), pycairo, a mon
   the others are hidden but keep running. same button/keys restore the layout; splitting,
   closing or moving a tile in that tab restores it too
 - only the focused tile gets the blue frame (not with a single or maximized tile)
-- tabs: the tab bar shows up from 2 tabs on; closing the last tile of a tab closes the tab,
+- tabs: the tab bar shows up from 2 tabs on; all tabs are equally wide (bar width / number
+  of tabs), the title gets shortened in the middle (full title as tooltip), the number on the
+  right is the count of tiles in that tab. closing the last tile of a tab closes the tab,
   the last tab closes the window. a new tab starts in the cwd of the active tile
 - dark theme (headerbar, menus, tile headers)
 - select with the mouse (shift+drag inside mouse-grabbing apps) -> primary selection,

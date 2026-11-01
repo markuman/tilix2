@@ -169,6 +169,13 @@ def gui_tabs(win):
     assert t2 is not t1 and win.tiles() == [t2], 'new tab not active / tiles() not per tab'
     assert pump_until(lambda: t2.view.get_width() > 100), 'new tab gets no size'
     assert t2.view.cwd() == t1.view.cwd(), 'tab does not inherit cwd'
+    # fixed tab width: total / number of tabs, however long the titles are
+    t1.view.title = 'x'; win.retitle(t1)
+    t2.view.title = 'm@fw:~/git/osuv'; win.retitle(t2)    # fits: without homogeneous the tabs would differ
+    pump_until(lambda: False, 0.3)            # let the new titles get laid out first
+    widths = [t.head.get_width() for t in win.tabs]
+    assert widths[0] > 0 and abs(widths[0] - widths[1]) <= 1, f'tab widths differ: {widths}'
+    assert t1.tab.count.get_label() == '1' and t2.tab.count.get_label() == '1'
     key(win, Gdk.KEY_Page_Up, MT.CONTROL_MASK)
     assert win.active is t1 and win.tiles() == [t1], 'ctrl+pgup does not switch'
     key(win, Gdk.KEY_Page_Down, MT.CONTROL_MASK)
@@ -177,10 +184,12 @@ def gui_tabs(win):
     win.split(t2, vertical=False)
     assert pump_until(lambda: len(win.tiles()) == 2)
     t3 = win.active
+    assert t2.tab.count.get_label() == '2', f'tile count after split: {t2.tab.count.get_label()}'
     key(win, Gdk.KEY_Page_Up, MT.CONTROL_MASK)
     assert win.active is t1
     t3.view.proc.kill()
     assert pump_until(lambda: t3.get_root() is None), 'dead tile in background tab stays'
+    assert t2.tab.count.get_label() == '1', 'tile count after close in background tab'
     assert win.active is t1 and t2.tab.active is t2, 'background close steals the focus'
     assert win.get_focus() is t1.view, f'focus lost after background close: {win.get_focus()}'
     # close the last tile in the active tab -> tab closes, neighbor tab active

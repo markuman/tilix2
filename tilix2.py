@@ -989,8 +989,13 @@ class Tab(Gtk.Box):
         super().__init__(hexpand=True, vexpand=True)
         self.active = None            # last active tile in this tab
         self.maximized = None         # tile that fills the tab right now (the others are hidden)
-        self.label = Gtk.Label(label='tilix2', ellipsize=Pango.EllipsizeMode.MIDDLE, max_width_chars=30)
-        self.btn = Gtk.ToggleButton(child=self.label, group=group, hexpand=True, focus_on_click=False)
+        # width_chars=1: the title must not dictate the tab width (the bar splits it evenly)
+        self.label = Gtk.Label(label='tilix2', ellipsize=Pango.EllipsizeMode.MIDDLE, width_chars=1, hexpand=True)
+        self.count = Gtk.Label(css_classes=['dim-label', 'numeric'], tooltip_text='tiles in this tab')
+        inner = Gtk.Box(spacing=6)
+        inner.append(self.label)
+        inner.append(self.count)
+        self.btn = Gtk.ToggleButton(child=inner, group=group, hexpand=True, focus_on_click=False)
         self.btn.connect('toggled', lambda b: b.get_active() and win.show_tab(self))
         close = Gtk.Button(icon_name='window-close-symbolic', focus_on_click=False, tooltip_text='close tab')
         close.connect('clicked', lambda b: win.close_tab(self))
@@ -1053,8 +1058,9 @@ class Win(Gtk.ApplicationWindow):
         # own tab bar instead of Gtk.Notebook: its key bindings (ctrl+arrows, ctrl+tab)
         # would fire before the terminal. bar only visible from 2 tabs on.
         self.tabs = []
-        self.tabbar = Gtk.Box(spacing=4, margin_start=4, margin_end=4, margin_top=4, margin_bottom=4,
-                              visible=False)
+        # homogeneous: every tab gets total width / number of tabs, no matter how long the title is
+        self.tabbar = Gtk.Box(spacing=2, margin_start=2, margin_end=2, margin_top=2, margin_bottom=2,
+                              homogeneous=True, visible=False, css_classes=['tilix2-tabs'])
         self.stack = Gtk.Stack(hexpand=True, vexpand=True)
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         vbox.append(self.tabbar)
@@ -1071,7 +1077,12 @@ class Win(Gtk.ApplicationWindow):
         self.stack.add_child(tab)
         self.tabbar.append(tab.head)
         self.tabbar.set_visible(len(self.tabs) > 1)
+        self.recount(tab)
         tab.btn.set_active(True)              # -> show_tab
+
+    def recount(self, tab):
+        "number of tiles in the tab label (after split / close)."
+        tab.count.set_label(str(len(self.tiles(tab.get_first_child()))))
 
     def show_tab(self, tab):
         self.stack.set_visible_child(tab)
@@ -1107,7 +1118,9 @@ class Win(Gtk.ApplicationWindow):
     def retitle(self, tile):
         "terminal title -> window title (active tile) and tab label (active tile in the tab)."
         t = tile.view.title or 'tilix2'
-        if tile.tab.active is tile: tile.tab.label.set_label(t)
+        if tile.tab.active is tile:
+            tile.tab.label.set_label(t)
+            tile.tab.btn.set_tooltip_text(t)  # the label gets ellipsized in narrow tabs
         if self.active is tile: self.set_title(t)
 
     def _on_close(self, w):
@@ -1206,6 +1219,7 @@ class Win(Gtk.ApplicationWindow):
         except OSError: cwd = None
         new = Tile(self, tile.tab, cwd)
         self._insert(tile, new, vertical, before=False)
+        self.recount(tile.tab)
         self.activate_tile(new)
 
     def _insert(self, dst, new, vertical, before):
@@ -1259,6 +1273,7 @@ class Win(Gtk.ApplicationWindow):
             return
         tile.view.kill()
         other = self._detach(tile)
+        self.recount(tile.tab)
         if tile.tab.active is tile:            # in a background tab the focus stays where it is
             nxt = other if isinstance(other, Tile) else self.tiles(other)[0]
             if self.active is tile:
@@ -1305,6 +1320,7 @@ scrollbar.vertical.tilix2-slim > range > trough > slider {
 }
 scrollbar.vertical.tilix2-slim > range > trough > slider:hover { background-color: rgba(180,180,180,0.7); }
 .tilix2-head button { min-height: 0; min-width: 0; padding: 0 4px; }   /* keep the tile header slim */
+.tilix2-tabs button { min-height: 0; padding: 2px 8px; }               /* slimmer tabs */
 paned separator { min-width: 1px; min-height: 1px; background: rgba(128,128,128,0.35); }
 paned separator:hover { background: rgba(90,150,220,0.8); }
 """
