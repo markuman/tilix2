@@ -10,6 +10,8 @@ each tile gets its own pty + ghostty terminal. Keys go through ghostty's key enc
 (kitty keyboard protocol, so `ctrl+enter` in a TUI arrives as `CSI 13;5u`) and through
 a GTK input method first (dead keys, compose, ibus).
 
+![tilix2](tilix2.png)
+
 ## Install
 
 ```sh
