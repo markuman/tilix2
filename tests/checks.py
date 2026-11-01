@@ -3,7 +3,7 @@
 #
 #   python tests/checks.py              everything (gui checks need DISPLAY, e.g. xvfb-run -a)
 #   python tests/checks.py encoder      only headless key encoder/vt checks (no DISPLAY)
-#   python tests/checks.py <name>       one gui check: layout | tabs | dnd | input | clipboard | render | images |
+#   python tests/checks.py <name>       one gui check: layout | tabs | maximize | dnd | filedrop | input | clipboard | render | images |
 #                                       robust | scrollbar | perf
 #   (gui_robust prints a traceback on purpose: that's the tile with the broken feed)
 #
@@ -110,6 +110,13 @@ def gui_layout(win):
     assert pump_until(lambda: abs(t1.view.get_width() - t2.view.get_width()) < 20), \
         f'split not centered: {t1.view.get_width()} vs {t2.view.get_width()}'
     assert t2.view.cwd() == t1.view.cwd(), 'split does not inherit cwd'
+    # the tile that loses the focus gets redrawn (otherwise it keeps its blue focus frame)
+    calls = []
+    t2.view.queue_draw = lambda: calls.append(1)
+    win.activate_tile(t1)
+    del t2.view.queue_draw
+    assert calls and not t2.view.has_focus(), 'tile losing focus not redrawn -> stale focus frame'
+    win.activate_tile(t2)
     win.split(t2, vertical=True)
     assert pump_until(lambda: len(win.tiles()) == 3)
     assert t2.get_parent().get_orientation() == Gtk.Orientation.VERTICAL
@@ -181,6 +188,39 @@ def gui_tabs(win):
     assert win.tabs == [t2.tab] and win.active is t2 and not win.tabbar.get_visible(), 'tab close wrong'
     assert pump_until(lambda: t1.view.proc.poll() is not None), 'shell still alive after tab close'
 
+def gui_maximize(win):
+    from gi.repository import Gdk
+    CS = Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
+    t1 = win.active
+    win.toggle_maximize(t1)
+    assert t1.tab.maximized is None, 'single tile "maximized"'
+    win.split(t1, vertical=False)
+    assert pump_until(lambda: len(win.tiles()) == 2)
+    t2 = win.active
+    win.split(t2, vertical=True)
+    assert pump_until(lambda: len(win.tiles()) == 3 and win.active.get_height() > 50)
+    t3 = win.active
+    size = lambda t: (t.get_width(), t.get_height())
+    before = size(t3)
+    # ctrl+shift+x: t3 fills the tab, the others are gone
+    key(win, Gdk.KEY_X, CS, kc(Gdk.KEY_x))
+    assert t1.tab.maximized is t3 and not t1.get_mapped() and not t2.get_mapped(), 'others still visible'
+    assert pump_until(lambda: size(t3) == size(t3.tab)), f'not maximized: {size(t3)} vs tab {size(t3.tab)}'
+    assert t3.max_btn.get_icon_name() == 'view-restore-symbolic'
+    # header button restores, sizes come back
+    t3.max_btn.emit('clicked')
+    assert t3.tab.maximized is None and t1.get_mapped() and t2.get_mapped(), 'restore failed'
+    assert pump_until(lambda: size(t3) == before), f'sizes not restored: {size(t3)} vs {before}'
+    assert t3.max_btn.get_icon_name() == 'view-fullscreen-symbolic'
+    # tree changes while maximized restore first: split, close
+    win.toggle_maximize(t1)
+    win.split(t1, vertical=True)
+    assert pump_until(lambda: len(win.tiles()) == 4)
+    assert t1.tab.maximized is None and all(t.get_mapped() for t in win.tiles()), 'split while maximized hides tiles'
+    win.toggle_maximize(t2)
+    win.close_tile(t2)
+    assert t1.tab.maximized is None and len(win.tiles()) == 3 and all(t.get_mapped() for t in win.tiles())
+
 def gui_dnd(win):
     "real mouse drag via XTest (x11/xvfb only): drag the bottom header onto the right half of the top tile."
     import ctypes, threading
@@ -229,6 +269,64 @@ def gui_dnd(win):
     assert pump_until(lambda: t2.get_parent().get_orientation() == Gtk.Orientation.HORIZONTAL), 'drop moved nothing'
     p = t2.get_parent()
     assert p.get_start_child() is t1 and p.get_end_child() is t2 and t1.drop_zone is None, 'drop wrong'
+
+DRAG_SOURCE = '''
+import sys, gi
+gi.require_version('Gtk', '4.0')
+from gi.repository import Gtk, Gdk, Gio
+files = Gdk.FileList.new_from_list([Gio.File.new_for_path(p) for p in sys.argv[1:]])
+def act(app):
+    win = Gtk.ApplicationWindow(application=app, default_width=120, default_height=60, decorated=False)
+    lbl = Gtk.Label(label='DRAG')
+    ds = Gtk.DragSource(actions=Gdk.DragAction.COPY)
+    ds.connect('prepare', lambda *a: Gdk.ContentProvider.new_for_value(files))
+    lbl.add_controller(ds)
+    win.set_child(lbl)
+    win.connect('map', lambda w: print('mapped', flush=True))
+    win.present()
+app = Gtk.Application(flags=4)    # NON_UNIQUE
+app.connect('activate', act)
+app.run([])
+'''
+
+def gui_filedrop(win):
+    "drag files from another process (like nautilus) onto a tile -> shell-quoted paths as a paste."
+    import ctypes, tempfile, threading
+    from gi.repository import Gdk, Gio, Graphene
+    v = win.active.view
+    d = tempfile.mkdtemp()
+    paths = [os.path.join(d, 'a b.txt'), os.path.join(d, 'c.txt')]
+    want = f"'{paths[0]}' {paths[1]} "
+    v.term.feed(b'\x1b[?2004h')              # bracketed paste on, like opencode/bash
+    # direct: file list and plain text
+    sent = capture(v)
+    v._drop_external(None, Gdk.FileList.new_from_list([Gio.File.new_for_path(p) for p in paths]), 0, 0)
+    v._drop_external(None, 'hello', 0, 0)
+    assert sent == [b'\x1b[200~' + want.encode() + b'\x1b[201~', b'\x1b[200~hello\x1b[201~'], f'drop: {sent}'
+    sent.clear()
+    # real drag out of another process: undecorated source window sits at 0,0 on top of tilix2
+    X, T = ctypes.CDLL('libX11.so.6'), ctypes.CDLL('libXtst.so.6')
+    X.XOpenDisplay.restype = ctypes.c_void_p
+    dpy = ctypes.c_void_p(X.XOpenDisplay(None))
+    src = subprocess.Popen([sys.executable, '-c', DRAG_SOURCE, *paths], stdout=subprocess.PIPE, text=True)
+    try:
+        assert src.stdout.readline().strip() == 'mapped', 'drag source did not start'
+        time.sleep(0.3)
+        ok, p = v.compute_point(win, Graphene.Point().init(v.get_width() / 2, v.get_height() / 2))
+        ox, oy = win.get_surface_transform()
+        tx, ty = int(p.x + ox), int(p.y + oy)
+        def drive():
+            def mv(x, y): T.XTestFakeMotionEvent(dpy, -1, x, y, 0); X.XFlush(dpy); time.sleep(0.03)
+            def btn(down): T.XTestFakeButtonEvent(dpy, 1, down, 0); X.XFlush(dpy); time.sleep(0.15)
+            mv(30, 30); btn(True)
+            for i in range(1, 21): mv(30 + (tx - 30) * i // 20, 30 + (ty - 30) * i // 20)
+            btn(False)
+        th = threading.Thread(target=drive, daemon=True); th.start()
+        assert pump_until(lambda: not th.is_alive() and sent, 10), 'nothing arrived from the external drag'
+        assert sent == [b'\x1b[200~' + want.encode() + b'\x1b[201~'], f'external drop: {sent}'
+    finally:
+        src.kill()
+        del v.write
 
 def gui_input(win):
     import tilix2
@@ -303,7 +401,7 @@ def gui_clipboard(win):
     # selection is rendered inverted
     surf, cr, w, h = surface(v)
     v._draw(v, cr, w, h)
-    bgs, runs, _ = v._rowcache[0]
+    bgs, runs, _, _ = v._rowcache[0]
     assert bgs and bgs[0][0] == 0 and bgs[0][1] == 5, f'selection not highlighted: {bgs}'
     # mouse selection -> primary
     class G:      # fake gesture/controller: like gtk, button 1 held shows up in the state
@@ -348,7 +446,7 @@ def gui_render(win):
     c = v.colors
     FG = (c.foreground.r, c.foreground.g, c.foreground.b)
     BG = (c.background.r, c.background.g, c.background.b)
-    bgs, runs, chars = v._rowcache[0]
+    bgs, runs, _, chars = v._rowcache[0]
     texts = {r[3].get_text(): r for r in runs}
     assert 'RED' in texts and texts['RED'][2][0] > texts['RED'][2][1], f'RED not red: {texts.get("RED")}'
     assert any(r[1] == 2 and r[5] > 0 for r in runs), 'wide char not scaled to 2 cells'
@@ -374,6 +472,22 @@ def gui_render(win):
     v.term.feed(b'x')
     v._draw(v, cr, w, h)
     assert len(n) == 1, f'one char -> {len(n)} rows rebuilt'
+    del v._build_row
+    # box drawing on the cell grid (textual borders): no gaps, no drift
+    cw, ch = v.cell_w, v.cell_h
+    v.term.feed('\x1b[2J\x1b[H╭──╮\r\n│▊ │\r\n╰──╯\r\n'.encode() + b'M' * 60 + b'X\r\n')
+    v._draw(v, cr, w, h)
+    surf.flush()
+    col = [pixel(surf, cw // 2, ch + dy) for dy in range(ch)]
+    assert all(p == FG for p in col), f'gap in │: {col}'
+    line = [pixel(surf, x, ch // 2) for x in range(cw, 3 * cw)]
+    assert all(p == FG for p in line), 'gap in ─'
+    assert pixel(surf, cw + 1, ch + ch // 2) == FG and pixel(surf, 2 * cw - 1, ch + ch // 2) == BG, '▊ not 7/8 of the cell'
+    near = lambda p, q: all(abs(a - b) < 24 for a, b in zip(p, q))      # the arc is antialiased
+    assert near(pixel(surf, cw // 2, 2 * ch), FG) and pixel(surf, cw // 2, 3 * ch - 1) == BG, '╰: up = line, down = nothing'
+    assert near(pixel(surf, cw - 1, 2 * ch + ch // 2), FG), '╰ does not reach the right edge'
+    runs = v._rowcache[3][1]
+    assert len(runs) == 1 and abs(runs[0][3].get_extents()[1].width / 1024 - 61 * cw) < 1, 'run of 61 chars drifts off the grid'
 
 def gui_images(win):
     import base64, fcntl, struct, termios
@@ -524,7 +638,7 @@ def gui_perf(win):
     print(f'perf {v.cols}x{v.rows}: warm={warm:.1f}ms typing={typing:.1f}ms cold={cold:.1f}ms', flush=True)
     assert warm < 30 and typing < 30 and cold < 80, 'too slow'
 
-GUI = {'layout': gui_layout, 'tabs': gui_tabs, 'dnd': gui_dnd, 'input': gui_input, 'clipboard': gui_clipboard, 'render': gui_render,
+GUI = {'layout': gui_layout, 'tabs': gui_tabs, 'maximize': gui_maximize, 'dnd': gui_dnd, 'filedrop': gui_filedrop, 'input': gui_input, 'clipboard': gui_clipboard, 'render': gui_render,
        'images': gui_images, 'robust': gui_robust, 'scrollbar': gui_scrollbar, 'perf': gui_perf}
 
 def run_gui(fn):

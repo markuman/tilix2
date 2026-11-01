@@ -8,9 +8,10 @@
 #         ./venv/bin/python tilix2.py      (--system-site-packages: gi/gtk4 come from the system)
 # env:    TILIX2_SHELL, TILIX2_FONT ("Monospace 12"), TILIX2_FG / TILIX2_BG ("#rrggbb")
 # keys:   ctrl+alt+right/down split, ctrl+shift+w close, ctrl+shift+c/v copy/paste,
-#         ctrl+shift +/-/0 zoom, ctrl+shift+t new tab, ctrl+pgup/pgdn switch tab.
+#         ctrl+shift +/-/0 zoom, ctrl+shift+x maximize/restore tile, ctrl+shift+t new tab,
+#         ctrl+pgup/pgdn switch tab.
 #         right-click = menu, drag a tile header = move the tile
-import os, sys, pty, struct, fcntl, termios, shutil, subprocess, traceback
+import os, sys, pty, shlex, struct, fcntl, termios, shutil, subprocess, traceback, unicodedata
 
 VERSION = '1.0.0'
 if __name__ == '__main__' and '--version' in sys.argv[1:]:   # before gi/pyghostty: works without display/venv
@@ -24,7 +25,7 @@ except ModuleNotFoundError:
     sys.exit('PyGObject (gi) is missing — recreate the venv with `python3 -m venv --system-site-packages venv` '
              'or use the system python with python3-gi/pygobject.')
 gi.require_version('Gtk', '4.0')
-from gi.repository import Gtk, Gdk, Gio, GLib, Pango, PangoCairo
+from gi.repository import Gtk, Gdk, Gio, GLib, GObject, Pango, PangoCairo
 
 from pyghostty import Terminal, lib, ffi
 from pyghostty._ffi import union_fn
@@ -142,16 +143,87 @@ def _decode_png(userdata, alloc, data, n, out):
 lib.ghostty_sys_set(lib.GHOSTTY_SYS_OPT_DECODE_PNG, _decode_png)
 
 
+# box drawing + block elements are drawn on the cell grid ourselves (like kitty): font glyphs
+# don't fill the cell (gaps in vertical lines) and tuis build their borders from them.
+def _box_lines():
+    """U+2500-257F from their unicode names, e.g. 'DOWN LIGHT AND RIGHT HEAVY' ->
+    {char: ((left, right, up, down) with 0 none / 1 light / 2 heavy, rounded)}.
+    dashes, diagonals and double lines stay with the font."""
+    weights = {'LIGHT': 1, 'SINGLE': 1, 'HEAVY': 2}
+    dirs = {'LEFT': (0,), 'RIGHT': (1,), 'UP': (2,), 'DOWN': (3,), 'HORIZONTAL': (0, 1), 'VERTICAL': (2, 3)}
+    out = {}
+    for cp in range(0x2500, 0x2580):
+        name = unicodedata.name(chr(cp), '').removeprefix('BOX DRAWINGS ')
+        if any(s in name for s in ('DASH', 'DIAGONAL', 'DOUBLE')): continue
+        default = weights.get(name.split()[0], 1)          # 'LIGHT DOWN AND RIGHT': for every arm
+        arms = [0, 0, 0, 0]
+        for part in name.split(' AND '):                     # 'DOWN LIGHT', 'RIGHT HEAVY': per arm
+            w = next((weights[s] for s in part.split() if s in weights), default)
+            for s in part.split():
+                for i in dirs.get(s, ()): arms[i] = w
+        out[chr(cp)] = (tuple(arms), 'ARC' in name)
+    return out
+
+def _blocks():
+    "U+2580-259F: char -> rects (x, y, w, h) as fractions of the cell."
+    b = {'▀': [(0, 0, 1, .5)], '▐': [(.5, 0, .5, 1)], '▔': [(0, 0, 1, 1 / 8)], '▕': [(7 / 8, 0, 1 / 8, 1)]}
+    for i, c in enumerate('▁▂▃▄▅▆▇█', 1): b[c] = [(0, 1 - i / 8, 1, i / 8)]
+    for i, c in enumerate('▏▎▍▌▋▊▉', 1): b[c] = [(0, 0, i / 8, 1)]
+    q = {'UL': (0, 0, .5, .5), 'UR': (.5, 0, .5, .5), 'LL': (0, .5, .5, .5), 'LR': (.5, .5, .5, .5)}
+    for c, parts in (('▘', 'UL'), ('▝', 'UR'), ('▖', 'LL'), ('▗', 'LR'), ('▚', 'UL LR'), ('▞', 'UR LL'),
+                     ('▙', 'UL LL LR'), ('▛', 'UL UR LL'), ('▜', 'UL UR LR'), ('▟', 'UR LL LR')):
+        b[c] = [q[p] for p in parts.split()]
+    return b
+
+BOX_LINES, BLOCKS, SHADES = _box_lines(), _blocks(), {'░': .25, '▒': .5, '▓': .75}
+BOX_CHARS = BOX_LINES.keys() | BLOCKS.keys() | SHADES.keys()
+
+def draw_box(cr, c, x, y, w, h):
+    "box/block char c into the cell at x,y (w x h px) in the current source color, snapped to pixels."
+    if c in SHADES:
+        cr.save(); cr.rectangle(x, y, w, h); cr.clip(); cr.paint_with_alpha(SHADES[c]); cr.restore()
+    elif c in BLOCKS:
+        for fx, fy, fw, fh in BLOCKS[c]:
+            x1, y1 = x + round(fx * w), y + round(fy * h)
+            cr.rectangle(x1, y1, x + round((fx + fw) * w) - x1, y + round((fy + fh) * h) - y1)
+        cr.fill()
+    else:
+        arms, arc = BOX_LINES[c]
+        light = max(1, h // 16)
+        cx, cy = x + w // 2, y + h // 2                      # lines run through these pixels
+        if arc:                                              # ╭╮╯╰: curve from the vertical to the horizontal edge
+            px, py = cx + light % 2 / 2, cy + light % 2 / 2  # stroke centre (odd widths sit on .5)
+            cr.set_line_width(light)
+            cr.move_to(px, y + h if arms[3] else y)
+            cr.curve_to(px, py, px, py, x + w if arms[1] else x, py)
+            cr.stroke()
+            return
+        for i, weight in enumerate(arms):                    # each arm from the edge into the centre
+            if not weight: continue
+            t = light if weight == 1 else 2 * light + 1
+            a = t // 2
+            if i == 0: cr.rectangle(x, cy - a, cx - x + t - a, t)
+            elif i == 1: cr.rectangle(cx - a, cy - a, x + w - cx + a, t)
+            elif i == 2: cr.rectangle(cx - a, y, t, cy - y + t - a)
+            else: cr.rectangle(cx - a, cy - a, t, y + h - cy + a)
+        cr.fill()
+
+
 class Tile(Gtk.Box):
     "tile: header (pwd, drag it to move the tile) on top, TermView in the middle, slim scrollbar on the right."
 
     def __init__(self, win, tab, cwd=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, hexpand=True, vexpand=True)
         self.win, self.tab = win, tab
-        head = Gtk.Box(spacing=6, margin_top=2, margin_bottom=2, margin_start=6, margin_end=6)
+        head = Gtk.Box(spacing=6, margin_top=2, margin_bottom=2, margin_start=6, margin_end=6,
+                       css_classes=['tilix2-head'])
         head.append(Gtk.Image(icon_name='open-menu-symbolic', pixel_size=12))
         self.pwd_lbl = Gtk.Label(label='~', xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.MIDDLE)
         head.append(self.pwd_lbl)
+        self.max_btn = Gtk.Button(css_classes=['flat'], focus_on_click=False)
+        self.max_btn.connect('clicked', lambda b: win.toggle_maximize(self))
+        self.set_maximized(False)
+        head.append(self.max_btn)
         self.append(head)
         self.adj = Gtk.Adjustment()
         self._sbar_handler = self.adj.connect('value-changed', self._on_sbar)
@@ -176,6 +248,11 @@ class Tile(Gtk.Box):
         dt.connect('drop', self._drop)
         self.add_controller(dt)
         GLib.timeout_add(1000, self._tick)
+
+    def set_maximized(self, on):
+        "header button: maximize <-> restore."
+        self.max_btn.set_icon_name('view-restore-symbolic' if on else 'view-fullscreen-symbolic')
+        self.max_btn.set_tooltip_text(('restore tiles' if on else 'maximize tile') + ' (ctrl+shift+x)')
 
     def zone_at(self, x, y):
         "edge nearest to the cursor (tilix behavior): that's where the dragged tile lands."
@@ -263,7 +340,7 @@ class TermView(Gtk.DrawingArea):
         lib.ghostty_render_state_row_cells_new(ffi.NULL, self.cells)
         self.colors = init_sized('GhosttyRenderStateColors')
         self.cursor = init_sized('GhosttyRenderStateCursor')
-        self._rowcache = []     # per viewport row: (bg rects, text runs, char per column)
+        self._rowcache = []     # per viewport row: (bg rects, text runs, box chars, char per column)
         self.anchor = None      # cell where the mouse selection started
         self.mouse_pos = (0.0, 0.0)
         self.set_font(self.win.font)
@@ -273,6 +350,9 @@ class TermView(Gtk.DrawingArea):
         self._start_shell(cwd)
         self.set_draw_func(self._draw)
         self.connect('resize', lambda area, w, h: self._fit(w, h))
+        # focus border + block/hollow cursor depend on the focus: redraw when it comes *and* goes,
+        # otherwise the tile that lost it keeps its blue frame
+        self.connect('notify::has-focus', lambda *a: self.queue_draw())
         # keys come in at window level (Win._on_key), only mouse here
         click = Gtk.GestureClick(button=0)          # all buttons
         click.connect('pressed', self._press); click.connect('released', self._release)
@@ -281,9 +361,15 @@ class TermView(Gtk.DrawingArea):
         scr = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL
                                         | Gtk.EventControllerScrollFlags.DISCRETE)
         scr.connect('scroll', self._scroll); self.add_controller(scr)
+        # drops from other apps: files (text/uri-list, e.g. nautilus) or plain text. dragged tiles
+        # don't match these types, they fall through to the Tile's drop target.
+        ext = Gtk.DropTarget(actions=Gdk.DragAction.COPY)
+        ext.set_gtypes([Gdk.FileList, GObject.TYPE_STRING])     # order = preference: files first
+        ext.connect('drop', self._drop_external)
+        self.add_controller(ext)
         menu = Gio.Menu()
         for items in ((('split right\tctrl+alt+right', 'split-h'), ('split down\tctrl+alt+down', 'split-v'),
-                       ('new tab\tctrl+shift+t', 'new-tab')),
+                       ('maximize / restore tile\tctrl+shift+x', 'maximize'), ('new tab\tctrl+shift+t', 'new-tab')),
                       (('move tile left', 'move-left'), ('move tile right', 'move-right'),
                        ('move tile up', 'move-up'), ('move tile down', 'move-down')),
                       (('copy\tctrl+shift+c', 'copy'), ('paste\tctrl+shift+v', 'paste'),
@@ -440,6 +526,13 @@ class TermView(Gtk.DrawingArea):
                 if bold: d.set_weight(Pango.Weight.BOLD)
                 if ital: d.set_style(Pango.Style.ITALIC)
                 self.fonts[bold, ital] = d
+        # glyphs are narrower than the cell (8.8 px advance in a 9 px cell): a run of 100 chars would
+        # end 20 px short and borders drift apart. letter spacing stretches every glyph to the cell.
+        probe = Pango.Layout(self.get_pango_context())
+        probe.set_font_description(self.fonts[False, False])
+        probe.set_text('M')
+        self._grid_attrs = Pango.AttrList()
+        self._grid_attrs.insert(Pango.attr_letter_spacing_new(self.cell_w * Pango.SCALE - probe.get_extents()[1].width))
         self._rowcache.clear()      # layouts are tied to the old font
         if self.get_width():
             self._fit(self.get_width(), self.get_height())
@@ -610,19 +703,29 @@ class TermView(Gtk.DrawingArea):
     def paste(self, primary=False):
         "clipboard (ctrl+shift+v) or primary selection (middle-click)."
         def done(src, res):
-            try: t = src.read_text_finish(res)
-            except GLib.Error: return
-            if not t or self.dead: return
-            # ghostty_paste_encode: ESC & co. -> space (no escaping out of bracketed paste),
-            # brackets on mode 2004, otherwise \n -> \r. data gets sanitized in place.
-            data = t.encode()
-            out = ffi.new('char[]', len(data) + 12)    # + '\e[200~' + '\e[201~'
-            n = ffi.new('size_t*')
-            if lib.ghostty_paste_encode(ffi.new('char[]', data), len(data), self.term.mode(2004),
-                                        out, len(out), n) == 0:
-                self.write(ffi.buffer(out, n[0])[:])
+            try: self.paste_text(src.read_text_finish(res))
+            except GLib.Error: pass
         d = self.get_display()
         (d.get_primary_clipboard() if primary else d.get_clipboard()).read_text_async(None, done)
+
+    def paste_text(self, t):
+        """text into the pty as a paste (clipboard, drag&drop). ghostty_paste_encode: ESC & co. -> space
+        (no escaping out of bracketed paste), brackets on mode 2004, otherwise \\n -> \\r."""
+        if not t or self.dead: return
+        data = t.encode()
+        out = ffi.new('char[]', len(data) + 12)    # + '\e[200~' + '\e[201~'
+        n = ffi.new('size_t*')
+        if lib.ghostty_paste_encode(ffi.new('char[]', data), len(data), self.term.mode(2004),
+                                    out, len(out), n) == 0:
+            self.write(ffi.buffer(out, n[0])[:])
+
+    def _drop_external(self, dt, value, x, y):
+        "files from a file manager -> their paths, shell-quoted (like gnome-terminal/tilix); text -> as is."
+        if isinstance(value, Gdk.FileList):
+            value = ''.join(shlex.quote(f.get_path() or f.get_uri()) + ' ' for f in value.get_files())
+        self.paste_text(value)
+        self.win.activate_tile(self.tile)
+        return True
 
     # --- rendering ---
     def _build_row(self, FG, BG):
@@ -639,8 +742,8 @@ class TermView(Gtk.DrawingArea):
         gb = ffi.new('GhosttyBuffer*'); gb.ptr, gb.cap = buf, len(buf)
         flag = ffi.new('bool*'); raw = ffi.new('GhosttyCell*'); wide = ffi.new('uint32_t*')
         get = lib.ghostty_render_state_row_cells_get
-        bgs, runs, chars = [], [], []
-        run = None              # [x, text, ncells, fg, bold, italic, deco]
+        bgs, runs, boxes, chars = [], [], [], []
+        run = None              # [x, text, ncells, wide, fg, bold, italic, deco]
         x = 0
         while lib.ghostty_render_state_row_cells_next(cells):
             if get(cells, lib.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8, gb) == 0:
@@ -668,26 +771,30 @@ class TermView(Gtk.DrawingArea):
             chars.append(text)
             if not text:
                 run = None
+            elif text in BOX_CHARS:     # drawn by draw_box, not by the font
+                boxes.append((x, text, fg))
+                run = None
             else:
                 get(cells, lib.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, raw)
                 lib.ghostty_cell_get(raw[0], lib.GHOSTTY_CELL_DATA_WIDE, wide)
-                n = 2 if wide[0] == lib.GHOSTTY_CELL_WIDE_WIDE else 1
+                is_wide = wide[0] == lib.GHOSTTY_CELL_WIDE_WIDE   # cjk/emoji: own run, never merged
                 key = (fg, bold, ital, deco)
-                if run and n == 1 and run[2] == x - run[0] and run[3:] == list(key):
+                if run and not is_wide and not run[3] and run[0] + run[2] == x and run[4:] == list(key):
                     run[1] += text; run[2] += 1
                 else:
-                    run = [x, text, n, *key]
+                    run = [x, text, 2 if is_wide else 1, is_wide, *key]
                     runs.append(run)
             x += 1
         out = []
-        for x, text, n, fg, bold, ital, deco in runs:
+        for x, text, n, is_wide, fg, bold, ital, deco in runs:
             layout = Pango.Layout(self.get_pango_context())
             layout.set_font_description(self.fonts[bold, ital])
             layout.set_text(text)
+            if not is_wide: layout.set_attributes(self._grid_attrs)    # every glyph exactly one cell wide
             # scale wide chars (cjk, emoji) to exactly 2 cells
-            scale = 2 * self.cell_w / max(1, layout.get_pixel_size()[0]) if n == 2 else 0
+            scale = 2 * self.cell_w / max(1, layout.get_pixel_size()[0]) if is_wide else 0
             out.append((x, n, fg, layout, deco, scale))
-        return bgs, out, chars
+        return bgs, out, boxes, chars
 
     # --- kitty graphics ---
     def _images(self):
@@ -787,13 +894,16 @@ class TermView(Gtk.DrawingArea):
         # layers bottom to top: images below bg, cell bgs, images below text, text, images above text
         below_bg, below_text, above_text = self._images()
         self._draw_images(cr, below_bg)
-        for y, (bgs, _, _) in enumerate(cache):
+        for y, (bgs, _, _, _) in enumerate(cache):
             for x, n, col in bgs:
                 cr.set_source_rgb(*col)
                 cr.rectangle(x * cw, y * ch, n * cw, ch)
                 cr.fill()
         self._draw_images(cr, below_text)
-        for y, (_, runs, _) in enumerate(cache):
+        for y, (_, runs, boxes, _) in enumerate(cache):
+            for x, c, fg in boxes:
+                cr.set_source_rgb(*fg)
+                draw_box(cr, c, x * cw, y * ch, cw, ch)
             for x, n, fg, layout, deco, scale in runs:
                 cr.set_source_rgb(*fg)
                 if scale:
@@ -809,7 +919,7 @@ class TermView(Gtk.DrawingArea):
                         cr.fill()
         self._draw_images(cr, above_text)
         self._draw_cursor(cr, FG, BG)
-        if self.has_focus() and len(self.win.tiles()) > 1:
+        if self.has_focus() and len(self.win.tiles()) > 1 and self.tile.tab.maximized is None:
             cr.set_source_rgb(0.21, 0.52, 0.89)
             cr.set_line_width(2)
             cr.rectangle(1, 1, width - 2, height - 2)
@@ -844,8 +954,11 @@ class TermView(Gtk.DrawingArea):
         else:
             # block: fill the cell, draw the char underneath on top in the background color
             cr.rectangle(x * cw, y * ch, cw, ch); cr.fill()
-            chars = self._rowcache[y][2]
-            if x < len(chars) and chars[x]:
+            chars = self._rowcache[y][3]
+            if x < len(chars) and chars[x] in BOX_CHARS:
+                cr.set_source_rgb(*BG)
+                draw_box(cr, chars[x], x * cw, y * ch, cw, ch)
+            elif x < len(chars) and chars[x]:
                 layout = Pango.Layout(self.get_pango_context())
                 layout.set_font_description(self.fonts[False, False])
                 layout.set_text(chars[x])
@@ -875,6 +988,7 @@ class Tab(Gtk.Box):
     def __init__(self, win, group):
         super().__init__(hexpand=True, vexpand=True)
         self.active = None            # last active tile in this tab
+        self.maximized = None         # tile that fills the tab right now (the others are hidden)
         self.label = Gtk.Label(label='tilix2', ellipsize=Pango.EllipsizeMode.MIDDLE, max_width_chars=30)
         self.btn = Gtk.ToggleButton(child=self.label, group=group, hexpand=True, focus_on_click=False)
         self.btn.connect('toggled', lambda b: b.get_active() and win.show_tab(self))
@@ -905,7 +1019,7 @@ class Win(Gtk.ApplicationWindow):
         self.connect('notify::is-active', lambda w, p: self.im.focus_in() if w.is_active() else self.im.focus_out())
         for name in ('split-h', 'split-v', 'close', 'copy', 'paste', 'zoom-in', 'zoom-out',
                      'zoom-reset', 'move-left', 'move-right', 'move-up', 'move-down',
-                     'new-tab', 'tab-next', 'tab-prev'):
+                     'new-tab', 'tab-next', 'tab-prev', 'maximize'):
             a = Gio.SimpleAction.new(name, None)
             a.connect('activate', lambda a, p, name=name: self.action(name))
             self.add_action(a)
@@ -1006,7 +1120,7 @@ class Win(Gtk.ApplicationWindow):
         name = Gdk.keyval_name(keyval) or ''
         if state & MT.CONTROL_MASK and state & MT.SHIFT_MASK:
             # match by physical key, otherwise ctrl+shift+0 is '=' on de (and ')' on us)
-            act = {'c': 'copy', 'v': 'paste', 'w': 'close', 't': 'new-tab',
+            act = {'c': 'copy', 'v': 'paste', 'w': 'close', 't': 'new-tab', 'x': 'maximize',
                    'plus': 'zoom-in', 'equal': 'zoom-in', 'KP_Add': 'zoom-in',
                    'minus': 'zoom-out', 'KP_Subtract': 'zoom-out',
                    '0': 'zoom-reset', 'KP_0': 'zoom-reset'}.get(Gdk.keyval_name(base_keyval(keycode, keyval)))
@@ -1046,6 +1160,7 @@ class Win(Gtk.ApplicationWindow):
             desc.set_size(max(6 * Pango.SCALE, desc.get_size() + step))
             t.view.set_font(desc.to_string())    # only the active tile (tilix behavior)
         elif name.startswith('move-'): self.move(t, name[5:])
+        elif name == 'maximize': self.toggle_maximize(t)
         elif name == 'new-tab':
             try: cwd = t.view.cwd()
             except OSError: cwd = None
@@ -1055,8 +1170,38 @@ class Win(Gtk.ApplicationWindow):
             self.tabs[i % len(self.tabs)].btn.set_active(True)
 
     # --- tiling tree of Gtk.Paned ---
+    def toggle_maximize(self, tile):
+        "maximize: hide the sibling branches on the way up to the tab, the paneds give the tile all the space."
+        tab = tile.tab
+        if tab.maximized is not None:
+            self.restore(tab)
+            return
+        w = tile
+        while isinstance(p := w.get_parent(), Gtk.Paned):
+            (p.get_end_child() if p.get_start_child() is w else p.get_start_child()).set_visible(False)
+            w = p
+        if w is tile: return                   # only tile in the tab: nothing to hide
+        tab.maximized = tile
+        tile.set_maximized(True)
+        self.activate_tile(tile)
+        tile.view.queue_draw()                 # focus frame goes away (one visible tile)
+
+    def restore(self, tab):
+        "undo maximize: everything in the tab visible again (paned positions were never touched)."
+        if tab.maximized is None: return
+        def show(w):
+            w.set_visible(True)
+            if isinstance(w, Gtk.Paned):
+                show(w.get_start_child())
+                show(w.get_end_child())
+        show(tab.get_first_child())
+        tab.maximized.set_maximized(False)
+        tab.maximized.view.queue_draw()        # focus frame comes back
+        tab.maximized = None
+
     def split(self, tile, vertical):
         "halve the tile, new tile (in the same cwd) on the other half, the new one becomes active."
+        self.restore(tile.tab)                 # tree changes while maximized: show everything first
         try: cwd = tile.view.cwd()
         except OSError: cwd = None
         new = Tile(self, tile.tab, cwd)
@@ -1107,6 +1252,7 @@ class Win(Gtk.ApplicationWindow):
     def close_tile(self, tile):
         "close the tile; the neighbor takes over the space. last tile -> close tab, last tab -> close window."
         if tile.get_root() is None: return     # already gone (e.g. ctrl+shift+w and exit at the same time)
+        self.restore(tile.tab)
         parent = tile.get_parent()
         if not isinstance(parent, Gtk.Paned):
             self.close_tab(tile.tab)
@@ -1123,6 +1269,7 @@ class Win(Gtk.ApplicationWindow):
 
     def move(self, tile, direction):
         "swap the tile with its neighbor in the same paned if the direction fits."
+        self.restore(tile.tab)
         p = tile.get_parent()
         if not isinstance(p, Gtk.Paned): return
         if (direction in ('left', 'right')) != (p.get_orientation() == Gtk.Orientation.HORIZONTAL): return
@@ -1133,6 +1280,7 @@ class Win(Gtk.ApplicationWindow):
     def move_tile(self, src, dst, zone):
         "drag&drop: detach src and split it in at edge zone ('left'/'right'/'top'/'bottom') of dst."
         if src is dst or src.tab is not dst.tab or not isinstance(src.get_parent(), Gtk.Paned): return
+        self.restore(src.tab)
         self._detach(src)
         self._insert(dst, src, vertical=zone in ('top', 'bottom'), before=zone in ('left', 'top'))
         self.activate_tile(src)
@@ -1156,6 +1304,7 @@ scrollbar.vertical.tilix2-slim > range > trough > slider {
   background-color: rgba(160,160,160,0.45);
 }
 scrollbar.vertical.tilix2-slim > range > trough > slider:hover { background-color: rgba(180,180,180,0.7); }
+.tilix2-head button { min-height: 0; min-width: 0; padding: 0 4px; }   /* keep the tile header slim */
 paned separator { min-width: 1px; min-height: 1px; background: rgba(128,128,128,0.35); }
 paned separator:hover { background: rgba(90,150,220,0.8); }
 """

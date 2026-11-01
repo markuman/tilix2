@@ -16,6 +16,9 @@ a GTK input method first (dead keys, compose, ibus).
 make install        # -> ~/.local/bin/tilix2 with its own venv in ~/.local/share/tilix2/venv
 ```
 
+arch linux: `makepkg -si` in the repo builds a real package (system python, pyghostty
+wheel vendored to `/usr/lib/tilix2`, desktop entry `osuv.tilix2.desktop`).
+
 or manually:
 
 ```sh
@@ -28,23 +31,32 @@ System requirements: GTK4 + gobject-introspection (`python3-gi`), pycairo, a mon
 
 ## Usage
 
-- right-click a tile: split right/down, move tile, copy/paste, zoom, close
+- right-click a tile: split right/down, maximize, new tab, move tile, copy/paste, zoom, close
   (shift+right-click when the app grabbed the mouse)
 - shortcuts: `ctrl+alt+right/down` split, `ctrl+shift+w` close tile,
   `ctrl+shift+c/v` copy/paste, `ctrl+shift +/-/0` zoom/reset (active tile only),
-  `ctrl+shift+t` new tab, `ctrl+pgup/pgdn` previous/next tab
+  `ctrl+shift+x` maximize/restore tile, `ctrl+shift+t` new tab, `ctrl+pgup/pgdn` previous/next tab
+- maximize a tile (button on the right of its header, or `ctrl+shift+x`): it fills the tab,
+  the others are hidden but keep running. same button/keys restore the layout; splitting,
+  closing or moving a tile in that tab restores it too
+- only the focused tile gets the blue frame (not with a single or maximized tile)
 - tabs: the tab bar shows up from 2 tabs on; closing the last tile of a tab closes the tab,
   the last tab closes the window. a new tab starts in the cwd of the active tile
 - dark theme (headerbar, menus, tile headers)
 - select with the mouse (shift+drag inside mouse-grabbing apps) -> primary selection,
   middle-click pastes it. selections survive scrolling.
 - pastes are sanitized by ghostty (no escape out of bracketed paste)
+- drop files from a file manager onto a tile: their paths get pasted, shell-quoted and
+  space-separated (bracketed paste, so e.g. opencode attaches them); dropped text is pasted as is
 - drag a tile's header onto another tile: the half nearest to the cursor lights up,
   the tile gets moved there (left/right/top/bottom of the target)
 - a new split starts in the cwd of the active tile
 - each tile has a header with its cwd and a slim scrollbar
 - closing a tile sends SIGHUP to its shell (bash saves its history); a shell exiting
   closes its tile, the last tile closes the window
+- box drawing (`─│╭╮┼━┃…`) and block elements (`▀▄█▌▐▁▔▊░▒▓`, quadrants) are drawn on
+  the cell grid, not taken from the font (like kitty): tui borders (textual, htop, …) have no
+  gaps. text glyphs are stretched to exactly one cell, long runs don't drift off the grid
 - kitty graphics protocol (e.g. `kitten icat`): images via direct, file and
   shared memory transfer, png/rgb/rgba/gray, z-layers below/above text. the pty reports its
   size in pixels, `CSI 14/16/18 t` get answered. 64 MB of images per tile; png only (no other
@@ -62,15 +74,17 @@ env vars: `TILIX2_SHELL` (a single executable; falls back to `/bin/sh` if it doe
 ```sh
 python tests/checks.py encoder            # headless: key encoder / vt (no display needed)
 xvfb-run -a python tests/checks.py        # everything
-xvfb-run -a python tests/checks.py render # one gui check: layout|tabs|dnd|input|clipboard|render|images|robust|scrollbar|perf
+xvfb-run -a python tests/checks.py render # one gui check: layout|tabs|maximize|dnd|filedrop|input|clipboard|render|images|robust|scrollbar|perf
 ```
 
-the gui checks use x11 when `DISPLAY` is set (xvfb), `dnd` needs x11 (it drives the real mouse via XTest).
+the gui checks use x11 when `DISPLAY` is set (xvfb), `dnd` and `filedrop` need x11 (they drive the
+real mouse via XTest; `filedrop` drags out of a second process, like a file manager would).
 
 ## Known limitations
 
 - software rendering (cairo on CPU) — fine for typing; cached pango layouts per row,
   converted images are cached per image
+- double lines (`═║╔`), dashed and diagonal box chars still come from the font
 - kitty graphics: no unicode placeholders (virtual placements: tmux, probably yazi),
   no animation, no temp-file transfer (that option is broken in the libghostty-vt
   bundled with pyghostty 0.1.4; icat falls back to file/shm/direct)
