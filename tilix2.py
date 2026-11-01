@@ -11,6 +11,7 @@
 #         ctrl+shift +/-/0 zoom, ctrl+shift+x maximize/restore tile, ctrl+shift+t new tab,
 #         ctrl+pgup/pgdn switch tab.
 #         right-click = menu, drag a tile header = move the tile
+# license: WTFPL v2 — do what the fuck you want to (see LICENSE)
 import os, sys, pty, shlex, struct, fcntl, termios, shutil, subprocess, traceback, unicodedata
 
 VERSION = '1.0.0'

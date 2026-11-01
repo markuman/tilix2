@@ -94,3 +94,9 @@ real mouse via XTest; `filedrop` drags out of a second process, like a file mana
   can't be dragged at all
 - `ctrl+pgup/pgdn` switch tabs, programs never see them (same as tilix)
 - no sessions/profiles, no cursor blinking, no hyperlinks, no OSC 52 clipboard
+
+## License
+
+tilix2 itself: [WTFPL v2](LICENSE) — do what the fuck you want to.
+the vendored `pyghostty` wheel is Apache-2.0, libghostty-vt is MIT; their license files
+land in `/usr/share/licenses/tilix2/` when installed via the PKGBUILD.

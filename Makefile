@@ -21,6 +21,7 @@ help:
 install:
 	@mkdir -p $(BINDIR) $(APPDIR)
 	cp tilix2.py $(APPDIR)/tilix2.py
+	cp LICENSE $(APPDIR)/LICENSE
 	@if [ ! -x $(VENV)/bin/python ]; then \
 		echo "creating venv at $(VENV) (needs python3-gi/gtk4 on system, hence --system-site-packages)"; \
 		python3 -m venv --system-site-packages $(VENV) && $(VENV)/bin/pip install -q pyghostty==$(PYGHOSTTY); \
