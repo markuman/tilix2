@@ -73,7 +73,25 @@ System requirements: GTK4 + gobject-introspection (`python3-gi`), pycairo, a mon
 - `tilix2 --version`
 
 env vars: `TILIX2_SHELL` (a single executable; falls back to `/bin/sh` if it doesn't exist),
-`TILIX2_FONT` (e.g. `Monospace 12`, without a size 11 pt), `TILIX2_FG`/`TILIX2_BG` (`#rrggbb`)
+`TILIX2_FONT` (e.g. `Monospace 12`, without a size 11 pt), `TILIX2_FG`/`TILIX2_BG` (`#rrggbb`).
+alternatively in `$XDG_CONFIG_HOME/tilix2/config.py` (`~/.config/tilix2/config.py`), plain python
+with the same names — env vars win over the file:
+
+```py
+TILIX2_SHELL = '/usr/bin/fish'
+TILIX2_FONT = 'Monospace 12'
+TILIX2_BG = '#002b36'
+TILIX2_FG = '#839496'
+```.
+alternatively in `$XDG_CONFIG_HOME/tilix2/config.py` (`~/.config/tilix2/config.py`), plain python
+with the same names — env vars win over the file:
+
+```py
+TILIX2_SHELL = '/usr/bin/fish'
+TILIX2_FONT = 'Monospace 12'
+TILIX2_BG = '#002b36'
+TILIX2_FG = '#839496'
+```
 
 ## Tests
 

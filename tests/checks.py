@@ -443,6 +443,22 @@ def gui_clipboard(win):
     v._press(G(2), 1, 10.0, 10.0)
     assert pump_until(lambda: sent) and b'second' in sent[0], f'middle-click: {sent}'
     del v.write
+    # double-click selects a word (incl. path chars) -> primary; urls / OSC 8 links are found for ctrl+click
+    v.term.feed(b'\x1b[2J\x1b[Hfoo /usr/bin-x bar https://example.org/a?b=1). '
+                b'\x1b]8;;https://osc8.example/\x1b\\link\x1b]8;;\x1b\\\r\n')
+    surf, cr, w, h = surface(v); v._draw(v, cr, w, h)
+    v._press(G(1), 2, v.cell_w * 6.5, 1.0)
+    assert v.selected_text() == '/usr/bin-x', f'double-click: {v.selected_text()!r}'
+    assert read(d.get_primary_clipboard()) == '/usr/bin-x'
+    assert v.uri_at(v.cell_w * 25.5, 1.0) == 'https://example.org/a?b=1', v.uri_at(v.cell_w * 25.5, 1.0)
+    assert v.uri_at(v.cell_w * 48.5, 1.0) == 'https://osc8.example/', v.uri_at(v.cell_w * 48.5, 1.0)
+    assert v.uri_at(1.0, 1.0) is None
+    # drag-end (GestureDrag) finishes a drag-selection even when GestureClick never emits 'released'
+    v._press(G(1), 1, 1.0, 1.0); v._motion(G(1), v.cell_w * 2.5, 1.0)
+    class DG(G):
+        def get_start_point(s): return True, 1.0, 1.0
+    v._drag_end(DG(1), v.cell_w * 1.5, 0)
+    assert v.anchor is None and read(d.get_primary_clipboard()) == 'foo'
 
 def gui_render(win):
     v = win.active.view

@@ -2,7 +2,7 @@
 # tilix2.py goes to /usr/lib/tilix2, next to it the vendored pyghostty (not in the arch repos / aur,
 # the py3-none wheel only uses cffi in abi mode -> fits every python 3). runs on the system python.
 pkgname=tilix2
-pkgver=1.0.0
+pkgver=1.2.0
 pkgrel=1
 _pyghostty=0.1.4
 pkgdesc='tilix-style tiling terminal on libghostty-vt (gtk4, single python file)'

@@ -7,14 +7,16 @@
 # start:  python3 -m venv --system-site-packages venv && ./venv/bin/pip install pyghostty==0.1.4
 #         ./venv/bin/python tilix2.py      (--system-site-packages: gi/gtk4 come from the system)
 # env:    TILIX2_SHELL, TILIX2_FONT ("Monospace 12"), TILIX2_FG / TILIX2_BG ("#rrggbb")
+#         or in $XDG_CONFIG_HOME/tilix2/config.py (plain python, same names; env vars win)
 # keys:   ctrl+alt+right/down split, ctrl+shift+w close, ctrl+shift+c/v copy/paste,
 #         ctrl+shift +/-/0 zoom, ctrl+shift+x maximize/restore tile, ctrl+shift+t new tab,
 #         ctrl+pgup/pgdn switch tab.
-#         right-click = menu, drag a tile header = move the tile
+#         right-click = menu, drag a tile header = move the tile, ctrl+click = open link,
+#         select / double-click (word) / triple-click (line) = primary, middle-click = paste it
 # license: WTFPL v2 — do what the fuck you want to (see LICENSE)
-import os, sys, pty, shlex, struct, fcntl, termios, shutil, subprocess, traceback, unicodedata
+import os, re, sys, pty, shlex, struct, fcntl, termios, shutil, subprocess, traceback, unicodedata
 
-VERSION = '1.0.0'
+VERSION = '1.2.0'
 if __name__ == '__main__' and '--version' in sys.argv[1:]:   # before gi/pyghostty: works without display/venv
     sys.exit(print(f'tilix2 {VERSION}'))
 
@@ -101,9 +103,33 @@ def sized_font(s):
     if not d.get_size(): d.set_size(11 * Pango.SCALE)
     return d.to_string()
 
-DEFAULT_FONT = sized_font(os.environ.get('TILIX2_FONT', 'Monospace 11'))
-TERM_FG = hexrgb(os.environ.get('TILIX2_FG'), (212, 212, 212))
-TERM_BG = hexrgb(os.environ.get('TILIX2_BG'), (24, 26, 32))
+def _load_config():
+    "$XDG_CONFIG_HOME/tilix2/config.py (~/.config/tilix2/config.py): plain python setting TILIX2_* vars."
+    base = os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config')
+    path = os.path.join(base, 'tilix2', 'config.py')
+    cfg = {}
+    try:
+        with open(path, encoding='utf-8') as f:
+            exec(compile(f.read(), path, 'exec'), cfg)
+    except FileNotFoundError:
+        return cfg
+    except Exception:
+        print(f'tilix2: error in {path}:', file=sys.stderr)
+        traceback.print_exc()
+    return {k: v for k, v in cfg.items() if k.startswith('TILIX2_') and isinstance(v, str)}
+
+_CONFIG = _load_config()
+
+def setting(name, default=None):
+    "env var > config.py > default"
+    return os.environ.get(name) or _CONFIG.get(name) or default
+
+DEFAULT_FONT = sized_font(setting('TILIX2_FONT', 'Monospace 11'))
+TERM_FG = hexrgb(setting('TILIX2_FG'), (212, 212, 212))
+TERM_BG = hexrgb(setting('TILIX2_BG'), (24, 26, 32))
+WORD_CHARS = '-,./?%&#:_~@+='          # double-click selects these together with letters/digits
+URI_SCHEMES = {'http', 'https', 'ftp', 'file', 'mailto'}   # ctrl+click opens only these
+URL_RE = re.compile(r'(?:https?|ftp|file)://[^\s<>"\'`]+|mailto:[^\s<>"\'`]+')
 MOUSE_BTN = {1: lib.GHOSTTY_MOUSE_BUTTON_LEFT, 2: lib.GHOSTTY_MOUSE_BUTTON_MIDDLE,
              3: lib.GHOSTTY_MOUSE_BUTTON_RIGHT}
 
@@ -344,6 +370,7 @@ class TermView(Gtk.DrawingArea):
         self._rowcache = []     # per viewport row: (bg rects, text runs, box chars, char per column)
         self.anchor = None      # cell where the mouse selection started
         self.mouse_pos = (0.0, 0.0)
+        self._link_cursor = False
         self.set_font(self.win.font)
         # cell size to ghostty right away, not only at the first layout: a program that starts with the
         # shell (icat in .bashrc, tests) would otherwise place images with 0px cells -> cursor doesn't move
@@ -356,8 +383,13 @@ class TermView(Gtk.DrawingArea):
         self.connect('notify::has-focus', lambda *a: self.queue_draw())
         # keys come in at window level (Win._on_key), only mouse here
         click = Gtk.GestureClick(button=0)          # all buttons
-        click.connect('pressed', self._press); click.connect('released', self._release)
+        click.connect('pressed', self._press)
         self.add_controller(click)
+        # release via GestureDrag: GestureClick cancels itself once the pointer moves past the
+        # drag threshold and then never emits 'released' (= no primary copy after a drag-select)
+        drag = Gtk.GestureDrag(button=0)
+        drag.connect('drag-end', self._drag_end)
+        self.add_controller(drag)
         mot = Gtk.EventControllerMotion(); mot.connect('motion', self._motion); self.add_controller(mot)
         scr = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL
                                         | Gtk.EventControllerScrollFlags.DISCRETE)
@@ -384,7 +416,7 @@ class TermView(Gtk.DrawingArea):
 
     # --- process / pty ---
     def _start_shell(self, cwd):
-        shell = os.environ.get('TILIX2_SHELL') or os.environ.get('SHELL') or '/bin/sh'
+        shell = setting('TILIX2_SHELL') or os.environ.get('SHELL') or '/bin/sh'
         if not shutil.which(shell):
             print(f'tilix2: shell {shell!r} not found, using /bin/sh', file=sys.stderr)
             shell = '/bin/sh'
@@ -633,9 +665,52 @@ class TermView(Gtk.DrawingArea):
             self.pop.popup()
         elif btn == 2:
             self.paste(primary=True)          # middle-click: primary selection (X11/tilix behavior)
+        elif btn == 1 and state & MT.CONTROL_MASK and (uri := self.uri_at(x, y)):
+            Gtk.UriLauncher(uri=uri).launch(self.get_root(), None, None, None)
+        elif btn == 1 and n >= 2:             # double-click = word, triple-click = line
+            self.anchor = None
+            cx, cy = self._cell_at(x, y)
+            chars = self._rowcache[cy][3] if cy < len(self._rowcache) else []
+            a, b = (0, len(chars) - 1) if n >= 3 else self._word_at(chars, cx)
+            if a is None or b < a: return
+            self.select((a, cy), (b, cy))
+            self.copy(primary_only=True)
         elif btn == 1:
             self.anchor = self._cell_at(x, y)
             self.select(None)
+
+    @staticmethod
+    def _word_at(chars, x):
+        "word span around column x: alnum + WORD_CHARS (like tilix/vte), None if x is not on a word."
+        isword = lambda c: bool(c) and (c.isalnum() or c in WORD_CHARS)
+        if x >= len(chars) or not isword(chars[x]): return None, None
+        a = b = x
+        while a > 0 and isword(chars[a - 1]): a -= 1
+        while b + 1 < len(chars) and isword(chars[b + 1]): b += 1
+        return a, b
+
+    def uri_at(self, x, y):
+        "link under the pointer: OSC 8 hyperlink of the cell, else a url-looking word in the row."
+        if self.dead: return None
+        cx, cy = self._cell_at(x, y)
+        buf, n = ffi.new('uint8_t[]', 4096), ffi.new('size_t*')
+        if lib.ghostty_grid_ref_hyperlink_uri(self.term.ref(cx, cy, 'viewport'), buf, len(buf), n) == 0 and n[0]:
+            uri = ffi.buffer(buf, n[0])[:].decode('utf8', 'replace')
+            return uri if uri.split(':', 1)[0].lower() in URI_SCHEMES else None
+        chars = self._rowcache[cy][3] if cy < len(self._rowcache) else []
+        text, cols = '', []                    # text + column of every char (graphemes can be > 1 char)
+        for col, c in enumerate(chars):
+            c = c or ' '
+            text += c
+            cols += [col] * len(c)
+        for m in URL_RE.finditer(text):
+            if cols[m.start()] <= cx <= cols[m.end() - 1]:
+                return m.group().rstrip('.,;:!?\'")]>')
+        return None
+
+    def _drag_end(self, g, dx, dy):
+        ok, x, y = g.get_start_point()
+        self._release(g, 1, x + dx, y + dy)
 
     def _release(self, g, n, x, y):
         if self.dead: return
@@ -650,6 +725,10 @@ class TermView(Gtk.DrawingArea):
         if self.dead: return
         self.mouse_pos = (x, y)
         state = m.get_current_event_state()
+        link = bool(state & MT.CONTROL_MASK) and self.uri_at(x, y) is not None   # hand cursor over links
+        if link != self._link_cursor:
+            self._link_cursor = link
+            self.set_cursor_from_name('pointer' if link else None)
         if self.anchor is not None and not state & MT.BUTTON1_MASK:
             self.anchor = None      # release got lost (alt+tab while dragging): don't keep selecting
         if self.anchor is not None:
