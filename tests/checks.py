@@ -221,6 +221,11 @@ def gui_maximize(win):
     assert t3.tab.maximized is None and t1.get_mapped() and t2.get_mapped(), 'restore failed'
     assert pump_until(lambda: size(t3) == before), f'sizes not restored: {size(t3)} vs {before}'
     assert t3.max_btn.get_icon_name() == 'view-fullscreen-symbolic'
+    # close button next to the maximize button closes the tile
+    t3.max_btn.get_next_sibling().emit('clicked')
+    assert pump_until(lambda: len(win.tiles()) == 2 and t3.get_root() is None), 'close button failed'
+    win.split(t2, vertical=True)
+    assert pump_until(lambda: len(win.tiles()) == 3)
     # tree changes while maximized restore first: split, close
     win.toggle_maximize(t1)
     win.split(t1, vertical=True)
@@ -459,6 +464,19 @@ def gui_clipboard(win):
         def get_start_point(s): return True, 1.0, 1.0
     v._drag_end(DG(1), v.cell_w * 1.5, 0)
     assert v.anchor is None and read(d.get_primary_clipboard()) == 'foo'
+    # drag-select beyond the top edge: the viewport scrolls up, the selection follows (anchor in screen coords)
+    v.term.feed(b''.join(b'line%03d\r\n' % i for i in range(200)))
+    v.drag.is_active = lambda: True
+    v._press(G(1), 1, 1.0, v.cell_h * 0.5)                       # viewport row 0
+    top = v._top()
+    v.mouse_pos = (1.0, -5.0)
+    for _ in range(5): v._autoscroll()
+    assert v._top() == top - 5, f'no autoscroll: {v._top()} vs {top}'
+    txt = v.selected_text()
+    assert txt.count('\n') == 5, f'selection did not follow: {txt!r}'
+    del v.drag.is_active
+    assert v._autoscroll() is False, 'autoscroll keeps running without a drag'
+    v.anchor = None
 
 def gui_render(win):
     v = win.active.view

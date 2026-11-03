@@ -16,7 +16,7 @@
 # license: WTFPL v2 — do what the fuck you want to (see LICENSE)
 import os, re, sys, pty, shlex, struct, fcntl, termios, shutil, subprocess, traceback, unicodedata
 
-VERSION = '1.2.0'
+VERSION = '1.3.0'
 if __name__ == '__main__' and '--version' in sys.argv[1:]:   # before gi/pyghostty: works without display/venv
     sys.exit(print(f'tilix2 {VERSION}'))
 
@@ -251,6 +251,10 @@ class Tile(Gtk.Box):
         self.max_btn.connect('clicked', lambda b: win.toggle_maximize(self))
         self.set_maximized(False)
         head.append(self.max_btn)
+        close_btn = Gtk.Button(icon_name='window-close-symbolic', css_classes=['flat'], focus_on_click=False,
+                               tooltip_text='close tile (ctrl+shift+w)')
+        close_btn.connect('clicked', lambda b: win.close_tile(self))
+        head.append(close_btn)
         self.append(head)
         self.adj = Gtk.Adjustment()
         self._sbar_handler = self.adj.connect('value-changed', self._on_sbar)
@@ -368,7 +372,7 @@ class TermView(Gtk.DrawingArea):
         self.colors = init_sized('GhosttyRenderStateColors')
         self.cursor = init_sized('GhosttyRenderStateCursor')
         self._rowcache = []     # per viewport row: (bg rects, text runs, box chars, char per column)
-        self.anchor = None      # cell where the mouse selection started
+        self.anchor = None      # cell where the mouse selection started (screen coords: survives scrolling)
         self.mouse_pos = (0.0, 0.0)
         self._link_cursor = False
         self.set_font(self.win.font)
@@ -387,8 +391,11 @@ class TermView(Gtk.DrawingArea):
         self.add_controller(click)
         # release via GestureDrag: GestureClick cancels itself once the pointer moves past the
         # drag threshold and then never emits 'released' (= no primary copy after a drag-select)
-        drag = Gtk.GestureDrag(button=0)
+        self.drag = drag = Gtk.GestureDrag(button=0)
         drag.connect('drag-end', self._drag_end)
+        # drag-update also comes outside the widget (implicit grab) -> selection above/below the tile
+        drag.connect('drag-update', self._drag_update)
+        self._autoscrolling = False
         self.add_controller(drag)
         mot = Gtk.EventControllerMotion(); mot.connect('motion', self._motion); self.add_controller(mot)
         scr = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL
@@ -628,6 +635,16 @@ class TermView(Gtk.DrawingArea):
         return (min(self.cols - 1, max(0, int(x // self.cell_w))),
                 min(self.rows - 1, max(0, int(y // self.cell_h))))
 
+    def _top(self):
+        "viewport top in rows from the start of the scrollback (viewport row + this = screen row)."
+        sb = ffi.new('GhosttyTerminalScrollbar*')
+        lib.ghostty_terminal_get(self.term._t[0], lib.GHOSTTY_TERMINAL_DATA_SCROLLBAR, sb)
+        return sb.offset
+
+    def _screen_cell_at(self, x, y):
+        cx, cy = self._cell_at(x, y)
+        return cx, cy + self._top()
+
     def _mouse_to_app(self, state):
         "the app wants the mouse (mouse tracking) — unless shift is held (then we select ourselves)."
         return self.term.get('mouse_tracking', 'bool') and not state & MT.SHIFT_MASK
@@ -676,8 +693,11 @@ class TermView(Gtk.DrawingArea):
             self.select((a, cy), (b, cy))
             self.copy(primary_only=True)
         elif btn == 1:
-            self.anchor = self._cell_at(x, y)
+            self.anchor = self._screen_cell_at(x, y)
             self.select(None)
+            if not self._autoscrolling:
+                self._autoscrolling = True
+                GLib.timeout_add(50, self._autoscroll)
 
     @staticmethod
     def _word_at(chars, x):
@@ -712,6 +732,13 @@ class TermView(Gtk.DrawingArea):
         ok, x, y = g.get_start_point()
         self._release(g, 1, x + dx, y + dy)
 
+    def _drag_update(self, g, dx, dy):
+        "only selection: mouse-tracking apps already get their motion from the motion controller."
+        if self.anchor is None: return
+        ok, x, y = g.get_start_point()
+        self.mouse_pos = (x + dx, y + dy)
+        self._extend(*self.mouse_pos)
+
     def _release(self, g, n, x, y):
         if self.dead: return
         btn, state = g.get_current_button(), g.get_current_event_state()
@@ -732,13 +759,29 @@ class TermView(Gtk.DrawingArea):
         if self.anchor is not None and not state & MT.BUTTON1_MASK:
             self.anchor = None      # release got lost (alt+tab while dragging): don't keep selecting
         if self.anchor is not None:
-            cell = self._cell_at(x, y)
-            if cell == self.anchor: self.select(None)      # click jitter is not a selection
-            else: self.select(self.anchor, cell)
+            self._extend(x, y)
         elif self._mouse_to_app(state):
             btn = next((b for mask, b in ((MT.BUTTON1_MASK, 1), (MT.BUTTON2_MASK, 2), (MT.BUTTON3_MASK, 3))
                         if state & mask), 0)
             self._mencode(lib.GHOSTTY_MOUSE_ACTION_MOTION, MOUSE_BTN.get(btn, 0), x, y, state)
+
+    def _extend(self, x, y):
+        "drag the mouse selection from the anchor to (x, y)."
+        cell = self._screen_cell_at(x, y)
+        if cell == self.anchor: self.select(None)          # click jitter is not a selection
+        else: self.select(self.anchor, cell, 'screen')
+
+    def _autoscroll(self):
+        "while drag-selecting with the pointer above/below the tile: scroll a row per tick, selection follows."
+        if self.dead or self.anchor is None or not self.drag.is_active():   # released / drag cancelled
+            self._autoscrolling = False
+            return False
+        x, y = self.mouse_pos
+        d = -1 if y < 0 else 1 if y >= self.get_height() else 0
+        if d:
+            self.scroll(lib.GHOSTTY_SCROLL_VIEWPORT_DELTA, d)
+            self._extend(x, y)
+        return True
 
     def _scroll(self, c, dx, dy):
         if self.dead: return True
@@ -755,14 +798,14 @@ class TermView(Gtk.DrawingArea):
         return True
 
     # --- selection / clipboard ---
-    def select(self, a, b=None):
-        "selection from cell a to b (viewport coordinates); ghostty tracks it while scrolling."
+    def select(self, a, b=None, tag='viewport'):
+        "selection from cell a to b (viewport or screen coordinates); ghostty tracks it while scrolling."
         if self.dead: return
         sel = ffi.NULL
         if a is not None:
             sel = init_sized('GhosttySelection')
-            sel.start = self.term.ref(*a, 'viewport')[0]
-            sel.end = self.term.ref(*(b or a), 'viewport')[0]
+            sel.start = self.term.ref(*a, tag)[0]
+            sel.end = self.term.ref(*(b or a), tag)[0]
         lib.ghostty_terminal_set(self.term._t[0], lib.GHOSTTY_TERMINAL_OPT_SELECTION, sel)
         self.queue_draw()
 
